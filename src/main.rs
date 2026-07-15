@@ -1830,7 +1830,7 @@ impl eframe::App for HakEditor {
                 .show(&ctx, |ui| {
                     ui.heading("Aurora Hak Explorer (AHE) 0.1.0");
                     ui.label("Native HAK/ERF archive management for Linux.");
-                    ui.label("Copyright © 2026 Aurora Hak Explorer contributors");
+                    ui.label("Copyright © 2026 Winternite");
                     ui.hyperlink_to(
                         "GNU GPL v3 or later",
                         "https://www.gnu.org/licenses/gpl-3.0.html",

@@ -38,6 +38,6 @@ HAK, ERF, MOD, and SAV are variations of BioWare's ERF container. V1.0 uses 16-b
 
 ## License
 
-Copyright © 2026 Aurora Hak Explorer contributors.
+Copyright © 2026 Winternite.
 
 Licensed under the GNU General Public License, version 3 or later. See [LICENSE](LICENSE).
