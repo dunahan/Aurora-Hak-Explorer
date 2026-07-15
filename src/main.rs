@@ -1945,7 +1945,7 @@ impl eframe::App for HakEditor {
             egui::Window::new("About")
                 .open(&mut self.show_about)
                 .show(&ctx, |ui| {
-                    ui.heading("Aurora Hak Explorer (AHE) 0.2.2");
+                    ui.heading("Aurora Hak Explorer (AHE) 0.2.1");
                     ui.label("Native HAK/ERF archive management for Linux.");
                     ui.label("Copyright © 2026 Winternite");
                     ui.hyperlink_to(
@@ -2320,6 +2320,9 @@ fn decode_preview_image(bytes: &[u8], extension: &str) -> Result<image::DynamicI
         return image::load_from_memory_with_format(&standard_dds, image::ImageFormat::Dds)
             .map_err(|error| format!("Could not decode NWN DDS image: {error}"));
     }
+    if format == image::ImageFormat::Dds && is_bc5_dds(bytes) {
+        return decode_bc5_dds(bytes);
+    }
 
     image::load_from_memory_with_format(bytes, format)
         .or_else(|format_error| {
@@ -2328,6 +2331,110 @@ fn decode_preview_image(bytes: &[u8], extension: &str) -> Result<image::DynamicI
             image::load_from_memory(bytes).map_err(|_| format_error)
         })
         .map_err(|error| format!("Could not decode image: {error}"))
+}
+
+fn is_bc5_dds(bytes: &[u8]) -> bool {
+    bytes.len() >= 128 && bytes.starts_with(b"DDS ") && matches!(&bytes[84..88], b"ATI2" | b"BC5U")
+}
+
+fn decode_bc5_dds(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    if !is_bc5_dds(bytes) {
+        return Err("DDS is not an ATI2/BC5 texture".into());
+    }
+    let read_u32 = |offset: usize| {
+        u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("four-byte field"),
+        )
+    };
+    let height = read_u32(12);
+    let width = read_u32(16);
+    if width == 0 || height == 0 {
+        return Err("BC5 DDS has invalid dimensions".into());
+    }
+    let blocks_wide = width.div_ceil(4) as usize;
+    let blocks_high = height.div_ceil(4) as usize;
+    let top_level_size = blocks_wide
+        .checked_mul(blocks_high)
+        .and_then(|blocks| blocks.checked_mul(16))
+        .ok_or_else(|| "BC5 DDS dimensions are too large".to_owned())?;
+    if bytes.len() < 128 + top_level_size {
+        return Err("BC5 DDS pixel data is truncated".into());
+    }
+
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| "BC5 DDS dimensions are too large".to_owned())?;
+    let mut rgba = vec![0_u8; pixel_count * 4];
+    for block_y in 0..blocks_high {
+        for block_x in 0..blocks_wide {
+            let block_offset = 128 + (block_y * blocks_wide + block_x) * 16;
+            let red = decode_bc4_block(&bytes[block_offset..block_offset + 8]);
+            let green = decode_bc4_block(&bytes[block_offset + 8..block_offset + 16]);
+            for local_y in 0..4 {
+                for local_x in 0..4 {
+                    let x = block_x * 4 + local_x;
+                    let y = block_y * 4 + local_y;
+                    if x >= width as usize || y >= height as usize {
+                        continue;
+                    }
+                    let block_pixel = local_y * 4 + local_x;
+                    let r = red[block_pixel];
+                    let g = green[block_pixel];
+                    let normal_x = f32::from(r) / 127.5 - 1.0;
+                    let normal_y = f32::from(g) / 127.5 - 1.0;
+                    let normal_z = (1.0 - normal_x * normal_x - normal_y * normal_y)
+                        .max(0.0)
+                        .sqrt();
+                    let b = ((normal_z * 0.5 + 0.5) * 255.0).round() as u8;
+                    let output = (y * width as usize + x) * 4;
+                    rgba[output..output + 4].copy_from_slice(&[r, g, b, 255]);
+                }
+            }
+        }
+    }
+
+    let buffer = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "Could not construct BC5 preview image".to_owned())?;
+    Ok(image::DynamicImage::ImageRgba8(buffer))
+}
+
+fn decode_bc4_block(block: &[u8]) -> [u8; 16] {
+    debug_assert_eq!(block.len(), 8);
+    let endpoint_0 = block[0];
+    let endpoint_1 = block[1];
+    let mut palette = [0_u8; 8];
+    palette[0] = endpoint_0;
+    palette[1] = endpoint_1;
+    if endpoint_0 > endpoint_1 {
+        for index in 1..=6 {
+            palette[index + 1] = (((7 - index) as u16 * u16::from(endpoint_0)
+                + index as u16 * u16::from(endpoint_1)
+                + 3)
+                / 7) as u8;
+        }
+    } else {
+        for index in 1..=4 {
+            palette[index + 1] = (((5 - index) as u16 * u16::from(endpoint_0)
+                + index as u16 * u16::from(endpoint_1)
+                + 2)
+                / 5) as u8;
+        }
+        palette[6] = 0;
+        palette[7] = 255;
+    }
+
+    let mut packed_indices = 0_u64;
+    for (shift, byte) in block[2..8].iter().enumerate() {
+        packed_indices |= u64::from(*byte) << (shift * 8);
+    }
+    let mut values = [0_u8; 16];
+    for (pixel, value) in values.iter_mut().enumerate() {
+        let palette_index = ((packed_indices >> (pixel * 3)) & 0x7) as usize;
+        *value = palette[palette_index];
+    }
+    values
 }
 
 fn decode_plt_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
@@ -2553,6 +2660,24 @@ mod clipboard_tests {
         assert_eq!((decoded.width(), decoded.height()), (4, 4));
         let pixel = decoded.into_rgba8().get_pixel(0, 0).0;
         assert!(pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20);
+    }
+
+    #[test]
+    fn decodes_ati2_bc5_normal_map() {
+        let mut dds = vec![0_u8; 128];
+        dds[..4].copy_from_slice(b"DDS ");
+        dds[4..8].copy_from_slice(&124_u32.to_le_bytes());
+        dds[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        dds[16..20].copy_from_slice(&4_u32.to_le_bytes());
+        dds[76..80].copy_from_slice(&32_u32.to_le_bytes());
+        dds[80..84].copy_from_slice(&4_u32.to_le_bytes());
+        dds[84..88].copy_from_slice(b"ATI2");
+        dds.extend_from_slice(&[128, 128, 0, 0, 0, 0, 0, 0]);
+        dds.extend_from_slice(&[128, 128, 0, 0, 0, 0, 0, 0]);
+
+        let decoded = decode_preview_image(&dds, "dds").expect("ATI2 DDS should decode");
+        assert_eq!((decoded.width(), decoded.height()), (4, 4));
+        assert_eq!(decoded.into_rgba8().get_pixel(0, 0).0, [128, 128, 255, 255]);
     }
 
     #[test]
