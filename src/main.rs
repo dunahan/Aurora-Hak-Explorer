@@ -1065,7 +1065,7 @@ impl eframe::App for HakEditor {
                 ui.menu_button("View", |ui| {
                     if ui
                         .checkbox(&mut self.compact_mode, "Compact mode")
-                        .on_hover_text("Hide the resource tree and details panes")
+                        .on_hover_text("Hide the resource tree and details panes; always show every resource")
                         .clicked()
                     {
                         ui.close();
@@ -1427,7 +1427,10 @@ impl eframe::App for HakEditor {
             ui.separator();
             if let Some(a) = self.archive.as_ref() {
                 let filter = self.filter.to_ascii_lowercase();
-                let category = self.category.clone();
+                // Compact mode deliberately ignores the tree's active category.  The tree is
+                // hidden in this mode, so leaving a prior selection such as "New" active
+                // must not make the main list look as if resources have disappeared.
+                let category = (!self.compact_mode).then(|| self.category.clone()).flatten();
                 let mut visible_indices: Vec<usize> = a
                     .entries
                     .iter()
@@ -1717,7 +1720,10 @@ impl eframe::App for HakEditor {
                                             request_export = true;
                                             ui.close();
                                         }
-                                        if ui.button("Delete selected").clicked() {
+                                        if ui
+                                            .button(format!("Delete selected ({count})"))
+                                            .clicked()
+                                        {
                                             request_delete = true;
                                             ui.close();
                                         }
