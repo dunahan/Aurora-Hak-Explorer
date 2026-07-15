@@ -1,4 +1,4 @@
-Aurora Hak Explorer 0.1.0 — Windows x86-64 portable test build
+Aurora Hak Explorer 0.2.0 — Windows x86-64 portable build
 
 No installation is required. Run Aurora-Hak-Explorer.exe.
 

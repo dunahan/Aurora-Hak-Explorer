@@ -1834,7 +1834,7 @@ impl eframe::App for HakEditor {
             egui::Window::new("About")
                 .open(&mut self.show_about)
                 .show(&ctx, |ui| {
-                    ui.heading("Aurora Hak Explorer (AHE) 0.1.0");
+                    ui.heading("Aurora Hak Explorer (AHE) 0.2.0");
                     ui.label("Native HAK/ERF archive management for Linux.");
                     ui.label("Copyright © 2026 Winternite");
                     ui.hyperlink_to(
