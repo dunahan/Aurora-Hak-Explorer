@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-nwn-hak">
+    <comment>Neverwinter Nights HAK archive</comment>
+    <glob pattern="*.hak"/>
+  </mime-type>
+  <mime-type type="application/x-nwn-erf">
+    <comment>BioWare ERF archive</comment>
+    <glob pattern="*.erf"/>
+    <glob pattern="*.mod"/>
+    <glob pattern="*.sav"/>
+  </mime-type>
+</mime-info>

@@ -1,0 +1,11 @@
+#!/bin/sh
+APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+# Winit's native Wayland file-drop negotiation is rejected by some KDE/KWin
+# versions. XWayland's XDND bridge works reliably with Dolphin and other KDE
+# file managers, so prefer X11 when the session exposes a DISPLAY.
+if [ -n "${DISPLAY:-}" ]; then
+  unset WAYLAND_DISPLAY WAYLAND_SOCKET
+fi
+
+exec "$APPDIR/usr/bin/aurora-hak-explorer" "$@"

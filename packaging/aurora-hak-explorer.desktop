@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Aurora Hak Explorer
+Comment=Edit Neverwinter Nights HAK and ERF archives
+Exec=aurora-hak-explorer %F
+Icon=aurora-hak-explorer
+Terminal=false
+Categories=Development;
+Keywords=Neverwinter;NWN;HAK;ERF;modding;
+MimeType=application/x-nwn-hak;application/x-nwn-erf;
+StartupNotify=true
