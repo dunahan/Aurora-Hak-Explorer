@@ -143,6 +143,18 @@ struct HakEditor {
     cut_key_was_down: bool,
     paste_key_was_down: bool,
     compact_mode: bool,
+    image_preview: Option<ImagePreviewCache>,
+}
+
+struct ImagePreviewCache {
+    key: String,
+    result: Result<CachedImage, String>,
+}
+
+struct CachedImage {
+    texture: egui::TextureHandle,
+    width: usize,
+    height: usize,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -285,8 +297,90 @@ impl HakEditor {
             cut_key_was_down: false,
             paste_key_was_down: false,
             compact_mode,
+            image_preview: None,
         }
     }
+
+    fn show_image_preview(&mut self, ui: &mut egui::Ui, entry: &archive::Entry) {
+        const MAX_IMAGE_FILE_SIZE: u64 = 128 * 1024 * 1024;
+        const MAX_TEXTURE_SIDE: u32 = 4096;
+
+        let extension = entry.extension();
+        let size = entry.size().unwrap_or(0);
+        let key = format!(
+            "image-preview:{}:{}:{}:{}",
+            self.active_tab.unwrap_or(usize::MAX),
+            entry.filename(),
+            entry.type_id,
+            size
+        );
+
+        if self
+            .image_preview
+            .as_ref()
+            .is_none_or(|cache| cache.key != key)
+        {
+            let result = (|| -> Result<CachedImage, String> {
+                if size > MAX_IMAGE_FILE_SIZE {
+                    return Err(format!(
+                        "Image is too large to preview ({} limit)",
+                        human_size(MAX_IMAGE_FILE_SIZE)
+                    ));
+                }
+                let format = image_format_for(&extension)
+                    .ok_or_else(|| format!("Unsupported image format: {extension}"))?;
+                let bytes = entry
+                    .read_prefix(size)
+                    .map_err(|error| format!("Could not read image: {error}"))?;
+                let decoded = image::load_from_memory_with_format(&bytes, format)
+                    .map_err(|error| format!("Could not decode image: {error}"))?;
+                let width = decoded.width() as usize;
+                let height = decoded.height() as usize;
+                let decoded =
+                    if decoded.width() > MAX_TEXTURE_SIDE || decoded.height() > MAX_TEXTURE_SIDE {
+                        decoded.thumbnail(MAX_TEXTURE_SIDE, MAX_TEXTURE_SIDE)
+                    } else {
+                        decoded
+                    };
+                let rgba = decoded.into_rgba8();
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [rgba.width() as usize, rgba.height() as usize],
+                    rgba.as_raw(),
+                );
+                let texture =
+                    ui.ctx()
+                        .load_texture(key.clone(), color_image, egui::TextureOptions::LINEAR);
+                Ok(CachedImage {
+                    texture,
+                    width,
+                    height,
+                })
+            })();
+            self.image_preview = Some(ImagePreviewCache { key, result });
+        }
+
+        match &self.image_preview.as_ref().unwrap().result {
+            Ok(image) => {
+                let natural_size = image.texture.size_vec2();
+                let scale = (ui.available_width().max(1.0) / natural_size.x)
+                    .min(420.0 / natural_size.y)
+                    .min(1.0);
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Image::new(&image.texture).fit_to_exact_size(natural_size * scale),
+                    );
+                    ui.label(format!("{} × {} pixels", image.width, image.height));
+                });
+            }
+            Err(error) => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(90.0);
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                });
+            }
+        }
+    }
+
     fn fail(&mut self, context: &str, error: impl std::fmt::Display) {
         self.error = Some(format!("{context}: {error}"));
     }
@@ -326,6 +420,7 @@ impl HakEditor {
         self.active_tab = Some(index);
         self.typeahead.clear();
         self.typeahead_pending = false;
+        self.image_preview = None;
     }
     fn switch_tab(&mut self, index: usize) {
         if self.active_tab == Some(index) {
@@ -1065,7 +1160,9 @@ impl eframe::App for HakEditor {
                 ui.menu_button("View", |ui| {
                     if ui
                         .checkbox(&mut self.compact_mode, "Compact mode")
-                        .on_hover_text("Hide the resource tree and details panes; always show every resource")
+                        .on_hover_text(
+                            "Hide the resource tree and details panes; always show every resource",
+                        )
                         .clicked()
                     {
                         ui.close();
@@ -1358,32 +1455,44 @@ impl eframe::App for HakEditor {
                         ui.add_space(8.0);
                         ui.group(|ui| {
                             ui.set_min_height(300.0);
-                            match entry.read_prefix(256 * 1024) {
-                                Ok(bytes) if entry.extension() == "2da" => {
-                                    show_2da_preview(ui, &bytes)
-                                }
-                                Ok(bytes) if is_text_type(&entry.extension()) => {
-                                    let text = String::from_utf8_lossy(&bytes);
-                                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                                        ui.add(
-                                            egui::Label::new(RichText::new(text).monospace())
-                                                .selectable(true),
+                            let extension = entry.extension();
+                            if image_format_for(&extension).is_some() {
+                                self.show_image_preview(ui, entry);
+                            } else {
+                                match entry.read_prefix(256 * 1024) {
+                                    Ok(bytes) if entry.extension() == "2da" => {
+                                        show_2da_preview(ui, &bytes)
+                                    }
+                                    Ok(bytes) if is_text_type(&entry.extension()) => {
+                                        let text = String::from_utf8_lossy(&bytes);
+                                        egui::ScrollArea::both().auto_shrink(false).show(
+                                            ui,
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(text).monospace(),
+                                                    )
+                                                    .selectable(true),
+                                                );
+                                            },
                                         );
-                                    });
-                                }
-                                Ok(bytes) => {
-                                    ui.vertical_centered(|ui| {
-                                        ui.add_space(90.0);
-                                        ui.heading("Binary resource");
-                                        ui.label(format!(
-                                            "{} bytes loaded for inspection",
-                                            bytes.len()
-                                        ));
-                                        ui.label("Extract it to open it in a specialized editor.");
-                                    });
-                                }
-                                Err(error) => {
-                                    ui.colored_label(Color32::LIGHT_RED, error.to_string());
+                                    }
+                                    Ok(bytes) => {
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(90.0);
+                                            ui.heading("Binary resource");
+                                            ui.label(format!(
+                                                "{} bytes loaded for inspection",
+                                                bytes.len()
+                                            ));
+                                            ui.label(
+                                                "Extract it to open it in a specialized editor.",
+                                            );
+                                        });
+                                    }
+                                    Err(error) => {
+                                        ui.colored_label(Color32::LIGHT_RED, error.to_string());
+                                    }
                                 }
                             }
                         });
@@ -1430,7 +1539,9 @@ impl eframe::App for HakEditor {
                 // Compact mode deliberately ignores the tree's active category.  The tree is
                 // hidden in this mode, so leaving a prior selection such as "New" active
                 // must not make the main list look as if resources have disappeared.
-                let category = (!self.compact_mode).then(|| self.category.clone()).flatten();
+                let category = (!self.compact_mode)
+                    .then(|| self.category.clone())
+                    .flatten();
                 let mut visible_indices: Vec<usize> = a
                     .entries
                     .iter()
@@ -1720,9 +1831,7 @@ impl eframe::App for HakEditor {
                                             request_export = true;
                                             ui.close();
                                         }
-                                        if ui
-                                            .button(format!("Delete selected ({count})"))
-                                            .clicked()
+                                        if ui.button(format!("Delete selected ({count})")).clicked()
                                         {
                                             request_delete = true;
                                             ui.close();
@@ -1834,7 +1943,7 @@ impl eframe::App for HakEditor {
             egui::Window::new("About")
                 .open(&mut self.show_about)
                 .show(&ctx, |ui| {
-                    ui.heading("Aurora Hak Explorer (AHE) 0.2.0");
+                    ui.heading("Aurora Hak Explorer (AHE) 0.2.1");
                     ui.label("Native HAK/ERF archive management for Linux.");
                     ui.label("Copyright © 2026 Winternite");
                     ui.hyperlink_to(
@@ -2174,6 +2283,24 @@ fn is_text_type(extension: &str) -> bool {
     )
 }
 
+fn image_format_for(extension: &str) -> Option<image::ImageFormat> {
+    use image::ImageFormat;
+
+    Some(match extension.to_ascii_lowercase().as_str() {
+        "bmp" => ImageFormat::Bmp,
+        "dds" => ImageFormat::Dds,
+        "gif" => ImageFormat::Gif,
+        "ico" => ImageFormat::Ico,
+        "jpg" | "jpeg" | "jpe" => ImageFormat::Jpeg,
+        "png" => ImageFormat::Png,
+        "pbm" | "pgm" | "ppm" | "pnm" => ImageFormat::Pnm,
+        "tga" => ImageFormat::Tga,
+        "tif" | "tiff" => ImageFormat::Tiff,
+        "webp" => ImageFormat::WebP,
+        _ => return None,
+    })
+}
+
 fn show_2da_preview(ui: &mut egui::Ui, bytes: &[u8]) {
     let text = String::from_utf8_lossy(bytes);
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
@@ -2239,5 +2366,25 @@ mod clipboard_tests {
     fn removes_uri_list_crlf_residue() {
         let paths = sanitize_clipboard_paths(vec![PathBuf::from("/tmp/example.mdl\r")]);
         assert_eq!(paths, vec![PathBuf::from("/tmp/example.mdl")]);
+    }
+
+    #[test]
+    fn recognizes_previewable_image_extensions() {
+        assert_eq!(image_format_for("tga"), Some(image::ImageFormat::Tga));
+        assert_eq!(image_format_for("DDS"), Some(image::ImageFormat::Dds));
+        assert_eq!(image_format_for("png"), Some(image::ImageFormat::Png));
+        assert_eq!(image_format_for("jpg"), Some(image::ImageFormat::Jpeg));
+        assert_eq!(image_format_for("jpeg"), Some(image::ImageFormat::Jpeg));
+        assert_eq!(image_format_for("mdl"), None);
+    }
+
+    #[test]
+    fn decodes_a_preview_image() {
+        let decoded = image::load_from_memory_with_format(
+            include_bytes!("../assets/aheicon-256.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("the bundled PNG should decode through the preview path");
+        assert_eq!((decoded.width(), decoded.height()), (256, 256));
     }
 }
