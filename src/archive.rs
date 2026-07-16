@@ -7,6 +7,8 @@ use std::{
 use crate::resource_types::{extension_for, type_for};
 
 const HEADER_SIZE: u64 = 160;
+const MAX_ARCHIVE_ENTRIES: usize = 1_000_000;
+const MAX_LOCALIZED_STRING_TABLE_SIZE: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveVersion {
@@ -89,6 +91,10 @@ impl Entry {
     }
     pub fn filename(&self) -> String {
         format!("{}.{}", self.name, self.extension())
+    }
+    pub fn safe_filename(&self) -> io::Result<String> {
+        validate_archive_resource_name(&self.name, usize::MAX)?;
+        Ok(self.filename())
     }
     pub fn size(&self) -> io::Result<u64> {
         match &self.data {
@@ -223,6 +229,14 @@ impl Archive {
         let language_count = read_u32(&mut input)? as usize;
         let localized_size = read_u32(&mut input)? as u64;
         let entry_count = read_u32(&mut input)? as usize;
+        if localized_size > MAX_LOCALIZED_STRING_TABLE_SIZE {
+            return Err(invalid("localized string table is too large"));
+        }
+        if entry_count > MAX_ARCHIVE_ENTRIES {
+            return Err(invalid(format!(
+                "archive contains more than {MAX_ARCHIVE_ENTRIES} resources"
+            )));
+        }
         let localized_offset = read_u32(&mut input)? as u64;
         let key_offset = read_u32(&mut input)? as u64;
         let resource_offset = read_u32(&mut input)? as u64;
@@ -300,7 +314,9 @@ impl Archive {
             type_id: u16,
         }
         input.seek(SeekFrom::Start(key_offset))?;
-        let mut keys = Vec::with_capacity(entry_count);
+        let mut keys = Vec::new();
+        keys.try_reserve(entry_count)
+            .map_err(|_| invalid("archive key list is too large"))?;
         for _ in 0..entry_count {
             let mut name_bytes = vec![0; name_len];
             input.read_exact(&mut name_bytes)?;
@@ -314,11 +330,15 @@ impl Archive {
             if name.is_empty() {
                 return Err(invalid("archive contains an empty resource name"));
             }
+            validate_archive_resource_name(&name, name_len)?;
             keys.push(Key { name, type_id });
         }
 
         input.seek(SeekFrom::Start(resource_offset))?;
-        let mut entries = Vec::with_capacity(entry_count);
+        let mut entries = Vec::new();
+        entries
+            .try_reserve(entry_count)
+            .map_err(|_| invalid("archive resource list is too large"))?;
         for key in keys {
             let offset = read_u32(&mut input)? as u64;
             let size = read_u32(&mut input)? as u64;
@@ -393,24 +413,6 @@ impl Archive {
         })
     }
 
-    pub fn add_directory(&mut self, directory: impl AsRef<Path>) -> io::Result<(usize, usize)> {
-        let mut added = 0;
-        let mut skipped = 0;
-        let mut paths: Vec<_> = fs::read_dir(directory)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.is_file())
-            .collect();
-        paths.sort();
-        for path in paths {
-            match self.add_file(path) {
-                Ok(_) => added += 1,
-                Err(_) => skipped += 1,
-            }
-        }
-        Ok((added, skipped))
-    }
-
     pub fn merge(&mut self, other: &Archive) -> (usize, usize) {
         let mut added = 0;
         let mut replaced = 0;
@@ -443,7 +445,7 @@ impl Archive {
     pub fn extract_all(&self, directory: impl AsRef<Path>) -> io::Result<usize> {
         fs::create_dir_all(&directory)?;
         for (index, entry) in self.entries.iter().enumerate() {
-            self.export_entry(index, directory.as_ref().join(entry.filename()))?;
+            self.export_entry(index, directory.as_ref().join(entry.safe_filename()?))?;
         }
         Ok(self.entries.len())
     }
@@ -577,13 +579,27 @@ fn sanitize_name(raw: &str, max: usize) -> io::Result<String> {
         || lowered.len() > max
         || !lowered
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     {
         return Err(invalid(format!(
             "resource name must be 1-{max} ASCII letters, digits, or underscores"
         )));
     }
     Ok(lowered)
+}
+
+fn validate_archive_resource_name(name: &str, max: usize) -> io::Result<()> {
+    if name.is_empty()
+        || name.len() > max
+        || name
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'))
+    {
+        return Err(invalid(
+            "archive contains an unsafe resource name with path or control characters",
+        ));
+    }
+    Ok(())
 }
 fn check_range(offset: u64, size: u64, file_len: u64, label: &str) -> io::Result<()> {
     if offset.checked_add(size).is_none_or(|end| end > file_len) {
@@ -673,6 +689,64 @@ mod tests {
 
         let error = Archive::open(path).unwrap_err();
         assert!(error.to_string().contains("count exceeds"));
+    }
+
+    #[test]
+    fn rejects_unsafe_resource_names_before_they_can_escape_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsafe-name.hak");
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        archive.entries.push(Entry {
+            name: "sample".into(),
+            type_id: 0x000a,
+            data: EntryData::Memory(b"test".to_vec()),
+        });
+        archive.save(&path).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        let key_offset = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        bytes[key_offset..key_offset + 16].fill(0);
+        bytes[key_offset..key_offset + 9].copy_from_slice(b"../escape");
+        fs::write(&path, bytes).unwrap();
+
+        let error = Archive::open(path).unwrap_err();
+        assert!(error.to_string().contains("unsafe resource name"));
+    }
+
+    #[test]
+    fn extraction_rechecks_names_and_preserves_real_world_compatibility() {
+        for name in ["Metal weathered", "cav_copper-01", "cat_range_+1"] {
+            validate_archive_resource_name(name, 16).unwrap();
+        }
+        for name in ["../escape", r"C:\escape", "bad:name", "line\nbreak"] {
+            assert!(validate_archive_resource_name(name, 16).is_err());
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        archive.entries.push(Entry {
+            name: "../escape".into(),
+            type_id: 0x000a,
+            data: EntryData::Memory(b"must not escape".to_vec()),
+        });
+        assert!(archive.extract_all(&output).is_err());
+        assert!(!dir.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn rejects_impractical_resource_counts_before_allocating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("too-many.hak");
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        archive.save(&path).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[16..20].copy_from_slice(&((MAX_ARCHIVE_ENTRIES as u32) + 1).to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let error = Archive::open(path).unwrap_err();
+        assert!(error.to_string().contains("more than"));
     }
 
     #[test]

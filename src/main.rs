@@ -12,6 +12,7 @@ use archive::{Archive, ArchiveKind, ArchiveVersion};
 use eframe::egui::{self, Color32, RichText};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    fs,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -645,6 +646,10 @@ impl HakEditor {
             Ok(()) => {
                 self.dirty = false;
                 self.status = format!("Saved {}", path.display());
+                // Saving can change the archive path and replace external
+                // entries with archive slices. Update the tab once here
+                // instead of cloning the full archive every UI frame.
+                self.sync_current_tab();
             }
             Err(e) => self.fail("Could not save archive", e),
         }
@@ -763,23 +768,29 @@ impl HakEditor {
         let Some(path) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let selected_keys = self.selected_resource_keys();
-        let Some(archive) = self.archive.as_mut() else {
-            return;
-        };
-        match archive.add_directory(&path) {
-            Ok((added, skipped)) => {
-                self.dirty |= added > 0;
-                if added > 0 {
-                    self.image_preview = None;
-                    self.restore_selection_by_keys(&selected_keys);
-                }
-                self.status = format!(
-                    "Added {added} resources from {} ({skipped} skipped)",
-                    path.display()
-                );
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.fail("Could not read directory", error);
+                return;
             }
-            Err(e) => self.fail("Could not add directory", e),
+        };
+        let mut paths = Vec::new();
+        for entry in entries {
+            match entry {
+                Ok(entry) if entry.path().is_file() => paths.push(entry.path()),
+                Ok(_) => {}
+                Err(error) => {
+                    self.fail("Could not read a directory entry", error);
+                    return;
+                }
+            }
+        }
+        paths.sort();
+        if paths.is_empty() {
+            self.status = format!("No files found in {}", path.display());
+        } else {
+            self.add_paths(paths);
         }
     }
     fn merge(&mut self) {
@@ -819,10 +830,14 @@ impl HakEditor {
         if self.selected.len() == 1 {
             let index = *self.selected.first().unwrap();
             let entry = &archive.entries[index];
-            if let Some(path) = rfd::FileDialog::new()
-                .set_file_name(entry.filename())
-                .save_file()
-            {
+            let filename = match entry.safe_filename() {
+                Ok(filename) => filename,
+                Err(error) => {
+                    self.fail("Could not export resource", error);
+                    return;
+                }
+            };
+            if let Some(path) = rfd::FileDialog::new().set_file_name(filename).save_file() {
                 match archive.export_entry(index, &path) {
                     Ok(()) => self.status = format!("Exported {}", path.display()),
                     Err(e) => self.fail("Could not export resource", e),
@@ -832,7 +847,14 @@ impl HakEditor {
             let mut count = 0;
             for index in self.selected.clone() {
                 let entry = &archive.entries[index];
-                if let Err(e) = archive.export_entry(index, dir.join(entry.filename())) {
+                let filename = match entry.safe_filename() {
+                    Ok(filename) => filename,
+                    Err(error) => {
+                        self.fail("Could not export resources", error);
+                        return;
+                    }
+                };
+                if let Err(e) = archive.export_entry(index, dir.join(filename)) {
                     self.fail("Could not export resources", e);
                     return;
                 }
@@ -860,7 +882,14 @@ impl HakEditor {
             let Some(entry) = archive.entries.get(index) else {
                 continue;
             };
-            let path = directory.path().join(entry.filename());
+            let filename = match entry.safe_filename() {
+                Ok(filename) => filename,
+                Err(error) => {
+                    self.fail("Could not prepare resources for dragging", error);
+                    return;
+                }
+            };
+            let path = directory.path().join(filename);
             if let Err(error) = archive.export_entry(index, &path) {
                 self.fail("Could not prepare resources for dragging", error);
                 return;
@@ -900,7 +929,14 @@ impl HakEditor {
             let Some(entry) = archive.entries.get(index) else {
                 continue;
             };
-            let path = directory.path().join(entry.filename());
+            let filename = match entry.safe_filename() {
+                Ok(filename) => filename,
+                Err(error) => {
+                    self.fail("Could not prepare clipboard resources", error);
+                    return;
+                }
+            };
+            let path = directory.path().join(filename);
             if let Err(error) = archive.export_entry(index, &path) {
                 self.fail("Could not prepare clipboard resources", error);
                 return;
@@ -2102,11 +2138,19 @@ impl eframe::App for HakEditor {
             }
         });
         if self.show_new {
-            let mut open = true;
-            egui::Window::new("New archive")
-                .open(&mut open)
-                .collapsible(false)
+            let mut create = false;
+            let mut cancel = false;
+            let theme = if self.dark_mode {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            };
+            let modal = egui::Modal::new(egui::Id::new("new_archive_modal"))
+                .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(22.0))
                 .show(&ctx, |ui| {
+                    ui.set_min_width(500.0);
+                    ui.label(RichText::new("New archive").size(22.0).strong());
+                    ui.separator();
                     ui.label("Archive type");
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.new_kind, ArchiveKind::Hak, "HAK");
@@ -2126,31 +2170,64 @@ impl eframe::App for HakEditor {
                         "V1.1 — Neverwinter Nights 2",
                     );
                     ui.separator();
-                    if ui.button("Create").clicked() {
-                        self.new_archive();
-                    }
+                    ui.horizontal_centered(|ui| {
+                        if ui.button("Create").clicked() {
+                            create = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
                 });
-            self.show_new &= open;
+            if modal.should_close() {
+                cancel = true;
+            }
+            if create {
+                self.new_archive();
+            } else if cancel {
+                self.show_new = false;
+            }
         }
         if self.show_description {
-            let mut open = true;
-            egui::Window::new("Archive description")
-                .open(&mut open)
+            let mut apply = false;
+            let mut cancel = false;
+            let theme = if self.dark_mode {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            };
+            let modal = egui::Modal::new(egui::Id::new("archive_description_modal"))
+                .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(22.0))
                 .show(&ctx, |ui| {
+                    ui.set_min_width(520.0);
+                    ui.label(RichText::new("Archive description").size(22.0).strong());
+                    ui.separator();
                     ui.add(
                         egui::TextEdit::multiline(&mut self.description_buffer)
                             .desired_rows(8)
                             .desired_width(480.0),
                     );
-                    if ui.button("Apply").clicked() {
-                        if let Some(a) = self.archive.as_mut() {
-                            a.set_description(self.description_buffer.clone());
-                            self.dirty = true;
+                    ui.horizontal_centered(|ui| {
+                        if ui.button("Apply").clicked() {
+                            apply = true;
                         }
-                        self.show_description = false;
-                    }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
                 });
-            self.show_description &= open;
+            if modal.should_close() {
+                cancel = true;
+            }
+            if apply {
+                if let Some(archive) = self.archive.as_mut() {
+                    archive.set_description(self.description_buffer.clone());
+                    self.dirty = true;
+                }
+                self.show_description = false;
+            } else if cancel {
+                self.show_description = false;
+            }
         }
         if self.show_about {
             let mut close = false;
@@ -2419,7 +2496,6 @@ impl eframe::App for HakEditor {
                 self.error = None;
             }
         }
-        self.sync_current_tab();
         if self.force_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

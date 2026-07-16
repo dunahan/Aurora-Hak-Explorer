@@ -17,6 +17,11 @@ All notable changes to Aurora Hak Explorer are recorded here.
 - Bound image-preview dimensions and memory use for standard, DDS, and PLT images.
 - Reduce X11 clipboard-key polling overhead and promptly clean up superseded clipboard exports.
 - Correct ERF build dates across leap years.
+- Reject resource names that could escape extraction, drag, or clipboard directories while retaining compatibility with real-world community archives.
+- Bound archive key and resource table allocations before parsing untrusted files.
+- Route directory imports through the same per-file and replace-all overwrite confirmation used by other imports.
+- Avoid cloning large active archives every UI frame.
+- Make the new-archive and description editors modal so background actions cannot change their target.
 
 ## 0.2.3 — 2026-07-16
 
