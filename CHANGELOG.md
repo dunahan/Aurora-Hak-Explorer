@@ -11,6 +11,12 @@ All notable changes to Aurora Hak Explorer are recorded here.
 - Center the action buttons in the unsaved-changes dialog.
 - Improve compatibility with archives created by older ERF command-line tools.
 - Center and enlarge error dialogs for improved readability.
+- Harden malformed-archive handling against excessive localized-string allocations.
+- Keep imports tied to their originating tab and preserve selections when resources are re-sorted.
+- Prevent background keyboard shortcuts and file drops from acting through open dialogs.
+- Bound image-preview dimensions and memory use for standard, DDS, and PLT images.
+- Reduce X11 clipboard-key polling overhead and promptly clean up superseded clipboard exports.
+- Correct ERF build dates across leap years.
 
 ## 0.2.3 — 2026-07-16
 

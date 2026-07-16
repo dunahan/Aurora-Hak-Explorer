@@ -237,6 +237,14 @@ impl Archive {
             file_len,
             "localized strings",
         )?;
+        let minimum_localized_size = (language_count as u64)
+            .checked_mul(8)
+            .ok_or_else(|| invalid("localized string table is too large"))?;
+        if minimum_localized_size > localized_size {
+            return Err(invalid(
+                "localized string count exceeds the localized string table",
+            ));
+        }
         check_range(
             key_offset,
             (entry_count as u64) * (name_len as u64 + 8),
@@ -251,7 +259,10 @@ impl Archive {
         )?;
 
         input.seek(SeekFrom::Start(localized_offset))?;
-        let mut localized = Vec::with_capacity(language_count);
+        let mut localized = Vec::new();
+        localized
+            .try_reserve(language_count)
+            .map_err(|_| invalid("localized string table is too large"))?;
         let localized_end = localized_offset + localized_size;
         for index in 0..language_count {
             let language_id = read_u32(&mut input)?;
@@ -500,10 +511,9 @@ impl Archive {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let days = now / 86_400;
-        let year = 70 + days / 365;
-        write_u32(&mut output, year as u32)?;
-        write_u32(&mut output, (days % 365 + 1) as u32)?;
+        let (build_year, build_day) = erf_build_date(now / 86_400);
+        write_u32(&mut output, build_year)?;
+        write_u32(&mut output, build_day)?;
         write_u32(&mut output, self.description_strref)?;
         output.write_all(&[0; 116])?;
         for string in &self.localized {
@@ -543,6 +553,22 @@ impl Archive {
         }
         output.flush()
     }
+}
+
+fn erf_build_date(mut days_since_epoch: u64) -> (u32, u32) {
+    let mut year = 1970_u32;
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if days_since_epoch < days_in_year {
+            return (year - 1900, days_since_epoch as u32 + 1);
+        }
+        days_since_epoch -= days_in_year;
+        year += 1;
+    }
+}
+
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 fn sanitize_name(raw: &str, max: usize) -> io::Result<String> {
@@ -632,6 +658,29 @@ mod tests {
 
         let loaded = Archive::open(&path).unwrap();
         assert_eq!(loaded.description(), "Created by the old erf utility");
+    }
+
+    #[test]
+    fn rejects_localized_count_larger_than_its_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-count.hak");
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        archive.save(&path).unwrap();
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&1_000_000_u32.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let error = Archive::open(path).unwrap_err();
+        assert!(error.to_string().contains("count exceeds"));
+    }
+
+    #[test]
+    fn erf_build_dates_observe_leap_years() {
+        assert_eq!(erf_build_date(0), (70, 1));
+        assert_eq!(erf_build_date(365 + 365), (72, 1));
+        assert_eq!(erf_build_date(365 + 365 + 365), (72, 366));
+        assert_eq!(erf_build_date(365 + 365 + 366), (73, 1));
     }
 
     #[test]

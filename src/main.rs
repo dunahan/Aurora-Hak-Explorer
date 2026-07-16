@@ -16,6 +16,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+const MAX_IMAGE_FILE_SIZE: u64 = 128 * 1024 * 1024;
+const MAX_IMAGE_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_IMAGE_SIDE: u32 = 16_384;
+const MAX_TEXTURE_SIDE: u32 = 4096;
+
 fn main() -> eframe::Result {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
     if arguments
@@ -194,6 +199,8 @@ struct AddConflict {
 }
 
 struct AddBatch {
+    target_tab: usize,
+    selected_keys: BTreeSet<(String, u16)>,
     queue: VecDeque<PathBuf>,
     conflict: Option<AddConflict>,
     policy: ConflictPolicy,
@@ -204,8 +211,10 @@ struct AddBatch {
 }
 
 impl AddBatch {
-    fn new(paths: Vec<PathBuf>) -> Self {
+    fn new(paths: Vec<PathBuf>, target_tab: usize, selected_keys: BTreeSet<(String, u16)>) -> Self {
         Self {
+            target_tab,
+            selected_keys,
             queue: paths.into(),
             conflict: None,
             policy: ConflictPolicy::Ask,
@@ -312,9 +321,6 @@ impl HakEditor {
     }
 
     fn show_image_preview(&mut self, ui: &mut egui::Ui, entry: &archive::Entry) {
-        const MAX_IMAGE_FILE_SIZE: u64 = 128 * 1024 * 1024;
-        const MAX_TEXTURE_SIDE: u32 = 4096;
-
         let extension = entry.extension();
         let size = entry.size().unwrap_or(0);
         let key = format!(
@@ -410,11 +416,55 @@ impl HakEditor {
         })
     }
     fn sync_current_tab(&mut self) {
-        if let (Some(index), Some(state)) = (self.active_tab, self.current_tab_state()) {
-            if let Some(tab) = self.tabs.get_mut(index) {
-                *tab = state;
-            }
+        let Some(index) = self.active_tab else {
+            return;
+        };
+        let Some(state) = self.current_tab_state() else {
+            return;
+        };
+        if let Some(tab) = self.tabs.get_mut(index) {
+            *tab = state;
         }
+    }
+
+    fn blocking_dialog_open(&self) -> bool {
+        self.confirm_close_tab.is_some()
+            || self.pending_add.is_some()
+            || self.show_new
+            || self.show_description
+            || self.show_about
+            || self.error.is_some()
+    }
+
+    fn selected_resource_keys(&self) -> BTreeSet<(String, u16)> {
+        let Some(archive) = self.archive.as_ref() else {
+            return BTreeSet::new();
+        };
+        self.selected
+            .iter()
+            .filter_map(|index| archive.entries.get(*index))
+            .map(|entry| (entry.name.to_ascii_lowercase(), entry.type_id))
+            .collect()
+    }
+
+    fn restore_selection_by_keys(&mut self, keys: &BTreeSet<(String, u16)>) {
+        self.selected = self
+            .archive
+            .as_ref()
+            .map(|archive| {
+                archive
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        keys.contains(&(entry.name.to_ascii_lowercase(), entry.type_id))
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.selection_anchor = self.selected.first().copied();
+        self.selection_cursor = self.selected.last().copied();
     }
     fn load_tab(&mut self, index: usize) {
         let Some(tab) = self.tabs.get(index).cloned() else {
@@ -610,16 +660,31 @@ impl HakEditor {
             return;
         }
         if let Some(batch) = self.pending_add.as_mut() {
-            batch.queue.extend(paths);
+            if self.active_tab == Some(batch.target_tab) {
+                batch.queue.extend(paths);
+            } else {
+                self.pending_drop_files.extend(paths);
+            }
             return;
         }
-        self.pending_add = Some(AddBatch::new(paths));
+        let Some(target_tab) = self.active_tab else {
+            return;
+        };
+        let selected_keys = self.selected_resource_keys();
+        self.pending_add = Some(AddBatch::new(paths, target_tab, selected_keys));
         self.process_add_batch(ConflictAction::Continue);
     }
     fn process_add_batch(&mut self, action: ConflictAction) {
         let Some(mut batch) = self.pending_add.take() else {
             return;
         };
+        if self.active_tab != Some(batch.target_tab) {
+            self.error = Some(
+                "The destination archive changed during import. No remaining files were added."
+                    .to_owned(),
+            );
+            return;
+        }
         let Some(archive) = self.archive.as_mut() else {
             return;
         };
@@ -664,7 +729,13 @@ impl HakEditor {
             }
         }
 
-        self.dirty |= batch.added + batch.replaced > 0;
+        let changed = batch.added + batch.replaced > 0;
+        self.dirty |= changed;
+        if changed {
+            self.image_preview = None;
+            let selected_keys = batch.selected_keys.clone();
+            self.restore_selection_by_keys(&selected_keys);
+        }
         if batch.conflict.is_some() {
             self.status = format!(
                 "Added {}, replaced {}, skipped {} — waiting for overwrite choice",
@@ -692,12 +763,17 @@ impl HakEditor {
         let Some(path) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
+        let selected_keys = self.selected_resource_keys();
         let Some(archive) = self.archive.as_mut() else {
             return;
         };
         match archive.add_directory(&path) {
             Ok((added, skipped)) => {
                 self.dirty |= added > 0;
+                if added > 0 {
+                    self.image_preview = None;
+                    self.restore_selection_by_keys(&selected_keys);
+                }
                 self.status = format!(
                     "Added {added} resources from {} ({skipped} skipped)",
                     path.display()
@@ -715,11 +791,16 @@ impl HakEditor {
         };
         match Archive::open(&path) {
             Ok(other) => {
+                let selected_keys = self.selected_resource_keys();
                 let Some(current) = self.archive.as_mut() else {
                     return;
                 };
                 let (added, replaced) = current.merge(&other);
                 self.dirty |= added + replaced > 0;
+                if added + replaced > 0 {
+                    self.image_preview = None;
+                    self.restore_selection_by_keys(&selected_keys);
+                }
                 self.status = format!(
                     "Merged {}: {added} added, {replaced} replaced",
                     path.display()
@@ -837,6 +918,10 @@ impl HakEditor {
             self.fail("Could not copy resources to the system clipboard", error);
             return;
         }
+        // Clipboard file lists refer to these paths, so retain the newest
+        // export while it is on the clipboard. Older exports are no longer
+        // referenced and can be removed immediately.
+        self.clipboard_exports.clear();
         self.clipboard_exports.push(directory);
         if cut {
             self.delete_selected();
@@ -939,12 +1024,7 @@ impl eframe::App for HakEditor {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        let resource_context = !ctx.egui_wants_keyboard_input()
-            && self.confirm_close_tab.is_none()
-            && self.pending_add.is_none()
-            && !self.show_new
-            && !self.show_description
-            && self.error.is_none();
+        let resource_context = !ctx.egui_wants_keyboard_input() && !self.blocking_dialog_open();
         if resource_context {
             let has_selection = !self.selected.is_empty();
             let has_archive = self.archive.is_some();
@@ -968,12 +1048,15 @@ impl eframe::App for HakEditor {
         // egui-winit consumes Ctrl+V before producing a key event. If the
         // clipboard contains files instead of text it produces no Paste event
         // either, so query the X11 key state while Ctrl is held.
-        let cut_down = raw_input.modifiers.command && x11_keysym_down(b'x' as u64);
-        let paste_down = raw_input.modifiers.command && x11_keysym_down(b'v' as u64);
-        if raw_input.modifiers.command {
+        let (cut_down, paste_down) = if resource_context && raw_input.modifiers.command {
+            shortcut_keys_down()
+        } else {
+            (false, false)
+        };
+        if resource_context && raw_input.modifiers.command {
             // Keep sampling briefly while Ctrl is held so a file-list paste is
             // caught even though egui-winit does not forward it as an event.
-            ctx.request_repaint_after(Duration::from_millis(8));
+            ctx.request_repaint_after(Duration::from_millis(30));
         }
         if resource_context && !self.selected.is_empty() && cut_down && !self.cut_key_was_down {
             self.pending_clipboard_command = Some(ClipboardCommand::Cut);
@@ -1019,9 +1102,11 @@ impl eframe::App for HakEditor {
             self.request_quit();
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title()));
-        self.capture_typeahead(&ctx);
-        let dropped = std::mem::take(&mut self.pending_drop_files);
-        if !dropped.is_empty() {
+        if !self.blocking_dialog_open() {
+            self.capture_typeahead(&ctx);
+        }
+        if !self.blocking_dialog_open() && !self.pending_drop_files.is_empty() {
+            let dropped = std::mem::take(&mut self.pending_drop_files);
             let (archives, resources): (Vec<_>, Vec<_>) =
                 dropped.into_iter().partition(|path| is_archive_path(path));
             for path in archives {
@@ -1031,7 +1116,7 @@ impl eframe::App for HakEditor {
                 self.add_paths(resources);
             }
         }
-        if !self.hovered_drop_files.is_empty() {
+        if !self.blocking_dialog_open() && !self.hovered_drop_files.is_empty() {
             egui::Area::new(egui::Id::new("file_drop_overlay"))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1337,7 +1422,9 @@ impl eframe::App for HakEditor {
                     });
                 });
         });
-        if let Some(index) = requested_close {
+        if !self.blocking_dialog_open()
+            && let Some(index) = requested_close
+        {
             let dirty = if self.active_tab == Some(index) {
                 self.dirty
             } else {
@@ -1348,36 +1435,41 @@ impl eframe::App for HakEditor {
             } else {
                 self.close_tab(index);
             }
-        } else if let Some(index) = requested_switch {
+        } else if !self.blocking_dialog_open()
+            && let Some(index) = requested_switch
+        {
             self.switch_tab(index);
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
-            self.open_dialog();
+        let global_shortcuts_enabled =
+            !ctx.egui_wants_keyboard_input() && !self.blocking_dialog_open();
+        if global_shortcuts_enabled {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
+                self.open_dialog();
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+                self.save(false);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
+                self.show_new = true;
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A)) {
+                request_select_all = true;
+            }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
-            self.save(false);
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
-            self.show_new = true;
-        }
-        if !ctx.egui_wants_keyboard_input()
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A))
-        {
-            request_select_all = true;
-        }
-        if let Some(command) = self.pending_clipboard_command.take() {
+        let pending_clipboard_command = if global_shortcuts_enabled {
+            self.pending_clipboard_command.take()
+        } else {
+            self.pending_clipboard_command = None;
+            None
+        };
+        if let Some(command) = pending_clipboard_command {
             match command {
                 ClipboardCommand::Copy => request_copy = true,
                 ClipboardCommand::Cut => request_cut = true,
                 ClipboardCommand::Paste => request_paste = true,
             }
         }
-        let clipboard_shortcuts_enabled = !ctx.egui_wants_keyboard_input()
-            && self.confirm_close_tab.is_none()
-            && self.pending_add.is_none()
-            && !self.show_new
-            && !self.show_description
-            && self.error.is_none();
+        let clipboard_shortcuts_enabled = global_shortcuts_enabled;
         if clipboard_shortcuts_enabled {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C)) {
                 request_copy = true;
@@ -1396,25 +1488,21 @@ impl eframe::App for HakEditor {
         } else if request_paste {
             self.paste_from_clipboard();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::W)) {
-            if let Some(index) = self.active_tab {
+        if global_shortcuts_enabled {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::W))
+                && let Some(index) = self.active_tab
+            {
                 if self.dirty {
                     self.confirm_close_tab = Some(index);
                 } else {
                     self.close_tab(index);
                 }
             }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
+                self.delete_selected();
+            }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete)) {
-            self.delete_selected();
-        }
-        let keyboard_navigation = if !ctx.egui_wants_keyboard_input()
-            && self.confirm_close_tab.is_none()
-            && !self.show_new
-            && !self.show_description
-            && self.error.is_none()
-            && self.pending_add.is_none()
-        {
+        let keyboard_navigation = if global_shortcuts_enabled {
             let ctrl_shift = egui::Modifiers {
                 ctrl: true,
                 shift: true,
@@ -2347,29 +2435,35 @@ fn add_incoming(archive: &mut Archive, batch: &mut AddBatch, path: PathBuf) {
 }
 
 #[cfg(target_os = "linux")]
-fn x11_keysym_down(keysym: u64) -> bool {
+fn shortcut_keys_down() -> (bool, bool) {
     let Ok(xlib) = x11_dl::xlib::Xlib::open() else {
-        return false;
+        return (false, false);
     };
     unsafe {
         let display = (xlib.XOpenDisplay)(std::ptr::null());
         if display.is_null() {
-            return false;
+            return (false, false);
         }
-        let keycode = (xlib.XKeysymToKeycode)(display, keysym);
+        let cut_keycode = (xlib.XKeysymToKeycode)(display, b'x' as u64);
+        let paste_keycode = (xlib.XKeysymToKeycode)(display, b'v' as u64);
         let mut keys = [0_i8; 32];
         (xlib.XQueryKeymap)(display, keys.as_mut_ptr());
         (xlib.XCloseDisplay)(display);
-        keycode != 0 && (keys[(keycode / 8) as usize] as u8 & (1 << (keycode % 8))) != 0
+        let is_down = |keycode: u8| {
+            keycode != 0 && (keys[(keycode / 8) as usize] as u8 & (1 << (keycode % 8))) != 0
+        };
+        (is_down(cut_keycode), is_down(paste_keycode))
     }
 }
 
 #[cfg(target_os = "windows")]
-fn x11_keysym_down(keysym: u64) -> bool {
-    // The caller passes lower-case ASCII keysyms. Win32 virtual-key codes for
-    // alphabetic keys are the corresponding upper-case ASCII values.
-    let virtual_key = (keysym as u8).to_ascii_uppercase() as i32;
-    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(virtual_key) < 0 }
+fn shortcut_keys_down() -> (bool, bool) {
+    let is_down = |key: u8| unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+            key.to_ascii_uppercase() as i32
+        ) < 0
+    };
+    (is_down(b'x'), is_down(b'v'))
 }
 
 fn sanitize_clipboard_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -2654,20 +2748,62 @@ fn decode_preview_image(bytes: &[u8], extension: &str) -> Result<image::DynamicI
 
     if format == image::ImageFormat::Dds && !bytes.starts_with(b"DDS ") {
         let standard_dds = nwn_dds_to_standard(bytes)?;
-        return image::load_from_memory_with_format(&standard_dds, image::ImageFormat::Dds)
+        return decode_image_with_limits(&standard_dds, Some(image::ImageFormat::Dds))
             .map_err(|error| format!("Could not decode NWN DDS image: {error}"));
     }
     if format == image::ImageFormat::Dds && is_bc5_dds(bytes) {
         return decode_bc5_dds(bytes);
     }
 
-    image::load_from_memory_with_format(bytes, format)
-        .or_else(|format_error| {
-            // Some archives contain a resource whose type does not match its actual image
-            // encoding. Signature detection gives those resources a useful second chance.
-            image::load_from_memory(bytes).map_err(|_| format_error)
-        })
-        .map_err(|error| format!("Could not decode image: {error}"))
+    let format_error = match decode_image_with_limits(bytes, Some(format)) {
+        Ok(image) => return Ok(image),
+        Err(error) => error,
+    };
+    // Some archives contain a resource whose type does not match its actual image
+    // encoding. Signature detection gives those resources a useful second chance.
+    decode_image_with_limits(bytes, None)
+        .map_err(|_| format!("Could not decode image: {format_error}"))
+}
+
+fn decode_image_with_limits(
+    bytes: &[u8],
+    format: Option<image::ImageFormat>,
+) -> Result<image::DynamicImage, String> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut reader = if let Some(format) = format {
+        image::ImageReader::with_format(cursor, format)
+    } else {
+        image::ImageReader::new(cursor)
+            .with_guessed_format()
+            .map_err(|error| error.to_string())?
+    };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
+    reader.limits(limits);
+    reader.decode().map_err(|error| error.to_string())
+}
+
+fn preview_pixel_count(width: u32, height: u32, format: &str) -> Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err(format!("{format} has invalid dimensions"));
+    }
+    if width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE {
+        return Err(format!(
+            "{format} dimensions exceed the {MAX_IMAGE_SIDE} × {MAX_IMAGE_SIDE} preview limit"
+        ));
+    }
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| format!("{format} dimensions are too large"))?;
+    let decoded_bytes = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| format!("{format} dimensions are too large"))?;
+    if decoded_bytes as u64 > MAX_IMAGE_DECODE_BYTES {
+        return Err(format!("{format} decoded image is too large to preview"));
+    }
+    Ok(pixel_count)
 }
 
 fn is_bc5_dds(bytes: &[u8]) -> bool {
@@ -2687,9 +2823,7 @@ fn decode_bc5_dds(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     };
     let height = read_u32(12);
     let width = read_u32(16);
-    if width == 0 || height == 0 {
-        return Err("BC5 DDS has invalid dimensions".into());
-    }
+    let pixel_count = preview_pixel_count(width, height, "BC5 DDS")?;
     let blocks_wide = width.div_ceil(4) as usize;
     let blocks_high = height.div_ceil(4) as usize;
     let top_level_size = blocks_wide
@@ -2700,9 +2834,6 @@ fn decode_bc5_dds(bytes: &[u8]) -> Result<image::DynamicImage, String> {
         return Err("BC5 DDS pixel data is truncated".into());
     }
 
-    let pixel_count = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or_else(|| "BC5 DDS dimensions are too large".to_owned())?;
     let mut rgba = vec![0_u8; pixel_count * 4];
     for block_y in 0..blocks_high {
         for block_x in 0..blocks_wide {
@@ -2804,12 +2935,7 @@ fn decode_plt_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     };
     let width = read_u32(16);
     let height = read_u32(20);
-    if width == 0 || height == 0 {
-        return Err("PLT has invalid dimensions".into());
-    }
-    let pixel_count = (width as usize)
-        .checked_mul(height as usize)
-        .ok_or_else(|| "PLT dimensions are too large".to_owned())?;
+    let pixel_count = preview_pixel_count(width, height, "PLT")?;
     let payload_size = pixel_count
         .checked_mul(2)
         .ok_or_else(|| "PLT payload is too large".to_owned())?;
@@ -2851,9 +2977,7 @@ fn nwn_dds_to_standard(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let height = read_u32(4);
     let channels = read_u32(8);
     let linear_size = read_u32(12);
-    if width == 0 || height == 0 {
-        return Err("NWN DDS has invalid dimensions".into());
-    }
+    preview_pixel_count(width, height, "NWN DDS")?;
     let four_cc = match channels {
         3 => *b"DXT1",
         4 => *b"DXT5",
@@ -2979,11 +3103,8 @@ mod clipboard_tests {
 
     #[test]
     fn decodes_a_preview_image() {
-        let decoded = image::load_from_memory_with_format(
-            include_bytes!("../assets/aheicon-256.png"),
-            image::ImageFormat::Png,
-        )
-        .expect("the bundled PNG should decode through the preview path");
+        let decoded = decode_preview_image(include_bytes!("../assets/aheicon-256.png"), "png")
+            .expect("the bundled PNG should decode through the preview path");
         assert_eq!((decoded.width(), decoded.height()), (256, 256));
     }
 
@@ -3034,6 +3155,29 @@ mod clipboard_tests {
         let pixels = decoded.into_rgba8();
         assert_eq!(pixels.get_pixel(0, 0).0, [171, 47, 39, 255]);
         assert_eq!(pixels.get_pixel(1, 0).0, [21, 43, 87, 128]);
+    }
+
+    #[test]
+    fn rejects_oversized_custom_image_dimensions_before_allocating() {
+        let mut dds = vec![0_u8; 128];
+        dds[..4].copy_from_slice(b"DDS ");
+        dds[12..16].copy_from_slice(&20_000_u32.to_le_bytes());
+        dds[16..20].copy_from_slice(&20_000_u32.to_le_bytes());
+        dds[84..88].copy_from_slice(b"ATI2");
+        assert!(
+            decode_bc5_dds(&dds)
+                .unwrap_err()
+                .contains("dimensions exceed")
+        );
+
+        let mut plt = b"PLT V1  \x0a\0\0\0\0\0\0\0".to_vec();
+        plt.extend_from_slice(&20_000_u32.to_le_bytes());
+        plt.extend_from_slice(&20_000_u32.to_le_bytes());
+        assert!(
+            decode_plt_preview(&plt)
+                .unwrap_err()
+                .contains("dimensions exceed")
+        );
     }
 
     #[test]
