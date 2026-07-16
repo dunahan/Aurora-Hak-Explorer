@@ -2308,6 +2308,10 @@ fn is_text_type(extension: &str) -> bool {
             | "2da"
             | "txi"
             | "mtr"
+            | "lua"
+            | "ids"
+            | "shd"
+            | "jui"
             | "ini"
             | "xml"
             | "gui"
@@ -2772,6 +2776,10 @@ mod clipboard_tests {
         assert!(is_previewable_image("plt"));
         assert_eq!(category_for("plt"), "Textures");
         assert!(is_text_type("mtr"));
+        assert!(is_text_type("lua"));
+        assert!(is_text_type("ids"));
+        assert!(is_text_type("shd"));
+        assert!(is_text_type("jui"));
     }
 
     #[test]

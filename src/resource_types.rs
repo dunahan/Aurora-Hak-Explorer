@@ -9,7 +9,7 @@ const TYPES: &[(u16, &str)] = &[
     (0x0005, "wfx"),
     (0x0006, "plt"),
     (0x0007, "ini"),
-    (0x0008, "mp3"),
+    (0x0008, "bmu"),
     (0x0009, "mpg"),
     (0x000a, "txt"),
     (0x07d0, "plh"),
@@ -140,6 +140,11 @@ pub fn extension_for(type_id: u16) -> String {
 
 pub fn type_for(extension: &str) -> Option<u16> {
     let ext = extension.trim_start_matches('.').to_ascii_lowercase();
+    // NWN:EE accepts ordinary MP3 audio under the BMU resource type. Store
+    // imported .mp3 files as type 8 so archives remain game-compatible.
+    if ext == "mp3" {
+        return Some(0x0008);
+    }
     if let Some(hex) = ext.strip_prefix("type_") {
         return u16::from_str_radix(hex, 16).ok();
     }
@@ -155,6 +160,9 @@ mod tests {
 
     #[test]
     fn enhanced_edition_types_are_named() {
+        assert_eq!(extension_for(0x0008), "bmu");
+        assert_eq!(type_for("bmu"), Some(0x0008));
+        assert_eq!(type_for("mp3"), Some(0x0008));
         assert_eq!(extension_for(0x0818), "mtr");
         assert_eq!(extension_for(0x0819), "ktx");
         assert_eq!(extension_for(0x0820), "png");
