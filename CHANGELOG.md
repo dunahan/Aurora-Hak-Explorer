@@ -6,7 +6,11 @@ All notable changes to Aurora Hak Explorer are recorded here.
 
 - Display MTR material resources as selectable text in the Details pane.
 - Recognize BMU music resources and display their MP3 encoding, bitrate, sample rate, channels, and approximate duration.
-- Rename the main toolbar button to `Open`.
+- Open archives created by older ERF tools that incorrectly include the localized-string record header in the description length.
+- Center and enlarge error dialogs for improved readability.
+- Redesign archive tabs with cleaner active and hover states, integrated close buttons, and a right-click `Close tab` action.
+- Move the `Open` button beside the new-archive button in the document bar.
+- Give every Resource Tree category a consistent full-width selection style with aligned resource counts.
 
 ## 0.2.2 — 2026-07-16
 
@@ -26,4 +30,3 @@ All notable changes to Aurora Hak Explorer are recorded here.
 - Initial open-source release for Linux and Windows.
 - Open, create, edit, save, and validate HAK, ERF, MOD, and SAV archives.
 - Add tabbed archives, search, sorting, multi-selection, keyboard navigation, drag-and-drop, clipboard operations, importing, exporting, and overwrite confirmation.
-

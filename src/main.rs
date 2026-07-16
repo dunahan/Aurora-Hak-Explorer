@@ -1208,32 +1208,134 @@ impl eframe::App for HakEditor {
         let mut requested_switch = None;
         let mut requested_close = None;
         egui::Panel::top("document_tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("+").on_hover_text("New archive").clicked() {
-                    self.show_new = true;
-                }
-                egui::ScrollArea::horizontal()
-                    .id_salt("open_archive_tabs")
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for (index, tab) in self.tabs.iter().enumerate() {
-                                let active = self.active_tab == Some(index);
-                                let dirty = if active { self.dirty } else { tab.dirty };
-                                let label =
-                                    format!("{}{}", if dirty { "*" } else { "" }, tab.label());
-                                ui.push_id(index, |ui| {
-                                    if ui.selectable_label(active, label).clicked() {
-                                        requested_switch = Some(index);
-                                    }
-                                    if ui.small_button("x").on_hover_text("Close tab").clicked() {
-                                        requested_close = Some(index);
-                                    }
+            egui::ScrollArea::horizontal()
+                .id_salt("open_archive_tabs")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (new_rect, new_response) =
+                            ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+                        if new_response.hovered() {
+                            ui.painter().rect_filled(
+                                new_rect,
+                                4.0,
+                                ui.visuals().widgets.hovered.bg_fill,
+                            );
+                        }
+                        ui.painter().text(
+                            new_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "+",
+                            egui::FontId::proportional(18.0),
+                            ui.visuals().strong_text_color(),
+                        );
+                        if new_response.on_hover_text("New archive").clicked() {
+                            self.show_new = true;
+                        }
+                        ui.add_space(2.0);
+                        if ui
+                            .add_sized([52.0, 26.0], egui::Button::new("Open"))
+                            .on_hover_text("Open archive (Ctrl+O)")
+                            .clicked()
+                        {
+                            self.open_dialog();
+                        }
+                        ui.add_space(4.0);
+
+                        for (index, tab_state) in self.tabs.iter().enumerate() {
+                            let active = self.active_tab == Some(index);
+                            let dirty = if active { self.dirty } else { tab_state.dirty };
+                            let label =
+                                format!("{}{}", if dirty { "* " } else { "" }, tab_state.label());
+                            let selection = ui.visuals().selection.bg_fill;
+                            let tab = egui::Frame::new()
+                                .fill(if active {
+                                    selection.gamma_multiply(0.28)
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .stroke(if active {
+                                    egui::Stroke::new(1.0, selection.gamma_multiply(0.55))
+                                } else {
+                                    egui::Stroke::NONE
+                                })
+                                .corner_radius(4)
+                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let title = ui.add(
+                                            egui::Label::new(RichText::new(label).color(
+                                                if active {
+                                                    ui.visuals().strong_text_color()
+                                                } else {
+                                                    ui.visuals().text_color()
+                                                },
+                                            ))
+                                            .selectable(false)
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        let (close_rect, close) = ui.allocate_exact_size(
+                                            egui::vec2(18.0, 18.0),
+                                            egui::Sense::click(),
+                                        );
+                                        if close.hovered() {
+                                            ui.painter().rect_filled(
+                                                close_rect,
+                                                4.0,
+                                                selection.gamma_multiply(0.72),
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            close_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "×",
+                                            egui::FontId::proportional(14.0),
+                                            ui.visuals().strong_text_color(),
+                                        );
+                                        (title, close.on_hover_text("Close tab"))
+                                    })
+                                    .inner
                                 });
-                                ui.separator();
+                            if active {
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(
+                                            tab.response.rect.left() + 4.0,
+                                            tab.response.rect.bottom(),
+                                        ),
+                                        egui::pos2(
+                                            tab.response.rect.right() - 4.0,
+                                            tab.response.rect.bottom(),
+                                        ),
+                                    ],
+                                    egui::Stroke::new(2.0, selection),
+                                );
+                            } else if tab.response.hovered() {
+                                ui.painter().rect_stroke(
+                                    tab.response.rect,
+                                    4.0,
+                                    egui::Stroke::new(1.0, selection.gamma_multiply(0.75)),
+                                    egui::StrokeKind::Inside,
+                                );
                             }
-                        });
+                            tab.inner.0.context_menu(|ui| {
+                                if ui.button("Close tab").clicked() {
+                                    requested_close = Some(index);
+                                    ui.close();
+                                }
+                            });
+                            if tab.inner.0.clicked() {
+                                requested_switch = Some(index);
+                            }
+                            if tab.inner.1.clicked() {
+                                requested_close = Some(index);
+                            }
+                            ui.add_space(2.0);
+                        }
+                        if self.tabs.is_empty() {
+                            ui.label(RichText::new("No archives open").weak());
+                        }
                     });
-            });
+                });
         });
         if let Some(index) = requested_close {
             let dirty = if self.active_tab == Some(index) {
@@ -1408,20 +1510,15 @@ impl eframe::App for HakEditor {
                 .default_size(215.0)
                 .resizable(true)
                 .show(ui, |ui| {
-                    ui.heading("Resource Tree");
+                    ui.label(RichText::new("Resource Tree").size(17.0).strong());
                     ui.separator();
-                    if ui
-                        .selectable_label(self.category.is_none(), format!("📦 {name}     {count}"))
-                        .clicked()
-                    {
+                    let root_active = self.category.is_none();
+                    if resource_tree_row(ui, root_active, &name, count).clicked() {
                         self.category = None;
                     }
                     ui.indent("categories", |ui| {
                         let active = self.category.as_deref() == Some("New");
-                        if ui
-                            .selectable_label(active, format!("+ New     {new_count}"))
-                            .clicked()
-                        {
+                        if resource_tree_row(ui, active, "New", new_count).clicked() {
                             self.category = Some("New".to_owned());
                             self.selected.clear();
                             self.selection_anchor = None;
@@ -1429,10 +1526,7 @@ impl eframe::App for HakEditor {
                         }
                         for (category, amount) in &categories {
                             let active = self.category.as_deref() == Some(category);
-                            if ui
-                                .selectable_label(active, format!("📁 {category}     {amount}"))
-                                .clicked()
-                            {
+                            if resource_tree_row(ui, active, category, *amount).clicked() {
                                 self.category = Some(category.clone());
                                 self.selected.clear();
                                 self.selection_anchor = None;
@@ -1553,11 +1647,7 @@ impl eframe::App for HakEditor {
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open").clicked() {
-                    self.open_dialog();
-                }
                 if let Some((name, _, _, _, _)) = &archive_info {
-                    ui.separator();
                     ui.strong(name);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2159,17 +2249,42 @@ impl eframe::App for HakEditor {
             }
         }
         if let Some(message) = self.error.clone() {
-            let mut open = true;
-            egui::Window::new("Error")
-                .open(&mut open)
-                .collapsible(false)
+            let mut close = false;
+            let theme = if self.dark_mode {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            };
+            let modal = egui::Modal::new(egui::Id::new("error_modal"))
+                .frame(egui::Frame::popup(&ctx.style_of(theme)).inner_margin(24.0))
                 .show(&ctx, |ui| {
-                    ui.label(RichText::new(message).color(Color32::from_rgb(255, 130, 130)));
-                    if ui.button("Close").clicked() {
-                        self.error = None;
+                    ui.set_min_width(500.0);
+                    ui.set_max_width(650.0);
+                    ui.spacing_mut().item_spacing.y = 14.0;
+                    ui.label(
+                        RichText::new("Error")
+                            .size(22.0)
+                            .strong()
+                            .color(Color32::from_rgb(255, 130, 130)),
+                    );
+                    ui.separator();
+                    ui.label(
+                        RichText::new(message)
+                            .size(17.0)
+                            .color(Color32::from_rgb(255, 150, 150)),
+                    );
+                    ui.add_space(6.0);
+                    if ui
+                        .add_sized(
+                            [120.0, 38.0],
+                            egui::Button::new(RichText::new("Close").size(16.0)),
+                        )
+                        .clicked()
+                    {
+                        close = true;
                     }
                 });
-            if !open {
+            if modal.should_close() || close {
                 self.error = None;
             }
         }
@@ -2237,6 +2352,43 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+fn resource_tree_row(ui: &mut egui::Ui, active: bool, label: &str, count: usize) -> egui::Response {
+    let selection = ui.visuals().selection.bg_fill;
+    let row = egui::Frame::new()
+        .fill(if active {
+            selection.gamma_multiply(0.25)
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(if active {
+            egui::Stroke::new(1.0, selection.gamma_multiply(0.5))
+        } else {
+            egui::Stroke::NONE
+        })
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(6, 4))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::Label::new(label)
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(count.to_string()).weak());
+                });
+                response
+            })
+            .inner
+        });
+    ui.interact(
+        row.response.rect,
+        ui.id().with(("resource_tree_row", label)),
+        egui::Sense::click(),
+    )
 }
 
 fn sort_button(

@@ -253,12 +253,31 @@ impl Archive {
         input.seek(SeekFrom::Start(localized_offset))?;
         let mut localized = Vec::with_capacity(language_count);
         let localized_end = localized_offset + localized_size;
-        for _ in 0..language_count {
+        for index in 0..language_count {
             let language_id = read_u32(&mut input)?;
-            let size = read_u32(&mut input)? as usize;
-            if input.stream_position()?.saturating_add(size as u64) > localized_end {
+            let declared_size = read_u32(&mut input)? as u64;
+            let string_start = input.stream_position()?;
+            let remaining = localized_end.saturating_sub(string_start);
+            // Some archives produced by Gareth Hughes' old command-line `erf`
+            // utility store the size of the entire localized-string table in
+            // the sole string's length field. In that specific layout the
+            // declared length is eight bytes too large because it includes the
+            // language-id and length fields themselves. Accept only this exact
+            // legacy shape; other out-of-range strings remain errors.
+            let size = if declared_size > remaining
+                && language_count == 1
+                && index == 0
+                && declared_size == localized_size
+                && string_start == localized_offset + 8
+            {
+                remaining
+            } else if declared_size > remaining {
                 return Err(invalid("localized string exceeds its table"));
-            }
+            } else {
+                declared_size
+            };
+            let size =
+                usize::try_from(size).map_err(|_| invalid("localized string is too large"))?;
             let mut bytes = vec![0; size];
             input.read_exact(&mut bytes)?;
             localized.push(LocalizedString { language_id, bytes });
@@ -594,6 +613,25 @@ mod tests {
         let path = dir.path().join("bad.hak");
         fs::write(&path, b"HAK V1.0").unwrap();
         assert!(Archive::open(path).is_err());
+    }
+
+    #[test]
+    fn accepts_legacy_erf_tool_localized_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.hak");
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        archive.set_description("Created by the old erf utility".into());
+        archive.save(&path).unwrap();
+
+        // Reproduce the old utility's bug: the string length includes its own
+        // eight-byte localized-table record header.
+        let mut bytes = fs::read(&path).unwrap();
+        let localized_size = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        bytes[164..168].copy_from_slice(&localized_size.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+
+        let loaded = Archive::open(&path).unwrap();
+        assert_eq!(loaded.description(), "Created by the old erf utility");
     }
 
     #[test]
