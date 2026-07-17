@@ -24,7 +24,7 @@ const MAX_TEXTURE_SIDE: u32 = 4096;
 const MAX_RECENT_ARCHIVES: usize = 8;
 const MAX_MODEL_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_EXTRACTED_MODEL_STRINGS: usize = 2_000;
-const DISPLAY_VERSION: &str = "1.0";
+const DISPLAY_VERSION: &str = "1.0.0";
 
 fn main() -> eframe::Result {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -1247,10 +1247,12 @@ impl HakEditor {
         }
     }
     fn title(&self) -> String {
-        let name = self
-            .archive
+        let Some(archive) = self.archive.as_ref() else {
+            return "Aurora Hak Explorer".to_owned();
+        };
+        let name = archive
+            .path
             .as_ref()
-            .and_then(|a| a.path.as_ref())
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
             .unwrap_or("Untitled");
@@ -1588,6 +1590,50 @@ impl eframe::App for HakEditor {
                             .clicked()
                         {
                             self.open_dialog();
+                        }
+                        let recent_archives = self.recent_archives.clone();
+                        let mut requested_recent = None;
+                        let mut clear_recent = false;
+                        let (recent_response, _) = egui::containers::menu::MenuButton::from_button(
+                            egui::Button::new("Recent").min_size(egui::vec2(64.0, 26.0)),
+                        )
+                        .ui(ui, |ui| {
+                            ui.set_min_width(260.0);
+                            if recent_archives.is_empty() {
+                                ui.add_enabled(false, egui::Button::new("No recent archives"));
+                                return;
+                            }
+                            for path in recent_archives {
+                                let filename = path
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                if ui
+                                    .button(filename)
+                                    .on_hover_text(path.display().to_string())
+                                    .clicked()
+                                {
+                                    requested_recent = Some(path);
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Clear recent files").clicked() {
+                                clear_recent = true;
+                                ui.close();
+                            }
+                        });
+                        recent_response.on_hover_text("Open a recent archive");
+                        if clear_recent {
+                            self.recent_archives.clear();
+                        } else if let Some(path) = requested_recent {
+                            if path.is_file() {
+                                self.open_path(path);
+                            } else {
+                                self.recent_archives.retain(|recent| recent != &path);
+                                self.status =
+                                    format!("Removed missing recent archive: {}", path.display());
+                            }
                         }
                         ui.add_space(4.0);
 
