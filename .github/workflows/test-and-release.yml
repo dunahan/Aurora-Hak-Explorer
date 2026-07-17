@@ -7,6 +7,7 @@ on:
   # Triggers the workflow (tests + release) on every push/merge directly to the main branch
   push:
     branches: [ "main" ]
+  workflow_dispatch: # Allows manual triggering via the GitHub interface
 
 permissions:
   contents: write
@@ -39,8 +40,8 @@ jobs:
     name: Build Release for ${{ matrix.os }}
     needs: test
     # IMPORTANT: This job runs ONLY if the event was a push/merge to the main branch.
-    # This job is skipped entirely for pull requests.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # This job is skipped entirely for pull requests. NEW: Allows push OR manual start (workflow_dispatch) on the main branch.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
