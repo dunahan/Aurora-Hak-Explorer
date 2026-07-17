@@ -1,0 +1,95 @@
+name: Rust Multi-Platform CI & Release
+
+on:
+  # Triggers the workflow (tests only) on every new or updated pull request
+  pull_request:
+    branches: [ "main" ]
+  # Triggers the workflow (tests + release) on every push/merge directly to the main branch
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # Allows manual triggering via the GitHub interface
+
+permissions:
+  contents: write
+
+jobs:
+  # JOB 1: Testing (runs in parallel on all 3 platforms for PRs AND pushes to main)
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+    - name: Code auschecken
+      uses: actions/checkout@v4
+
+    - name: Rust Toolchain installieren
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust Cache aktivieren
+      uses: swatinem/rust-cache@v2
+
+    - name: Tests ausführen
+      run: cargo test --verbose
+
+  # JOB 2: Build & Release
+  release:
+    name: Build Release for ${{ matrix.os }}
+    needs: test
+    # IMPORTANT: This job runs ONLY if the event was a push/merge to the main branch.
+    # This job is skipped entirely for pull requests. NEW: Allows push OR manual start (workflow_dispatch) on the main branch.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            # Note: Ensure that the filename matches the binary name from your Cargo.toml exactly.
+            artifact_name: aurora-hak-explorer 
+            asset_name: aurora-hak-explorer-linux.tar.gz
+          - os: windows-latest
+            artifact_name: aurora-hak-explorer.exe
+            asset_name: aurora-hak-explorer-windows.zip
+          - os: macos-latest
+            artifact_name: aurora-hak-explorer
+            asset_name: aurora-hak-explorer-macos.tar.gz
+
+    steps:
+    - name: Code auschecken
+      uses: actions/checkout@v4
+
+    - name: Rust Toolchain installieren
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Rust Cache aktivieren
+      uses: swatinem/rust-cache@v2
+
+    - name: Release-Build erstellen
+      run: cargo build --release
+
+    # Platform-specific packaging
+    - name: Paketieren (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: pwsh
+      run: |
+        Compress-Archive -Path target/release/${{ matrix.artifact_name }} -DestinationPath ./${{ matrix.asset_name }}
+
+    - name: Paketieren (Linux & macOS)
+      if: matrix.os != 'windows-latest'
+      run: |
+        tar -czf ./${{ matrix.asset_name }} -C target/release ${{ matrix.artifact_name }}
+
+    # Uploads the finished file and creates a release with a sequential number
+    - name: GitHub Release automatisch erstellen
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: "build-${{ github.run_number }}"
+        name: "Automated Build #${{ github.run_number }}"
+        files: ./${{ matrix.asset_name }}
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
