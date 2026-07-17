@@ -2,7 +2,7 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
-## 1.0.0 — 2026-07-17
+## 1.0 — 2026-07-17
 
 - Close archive tabs by middle-clicking them.
 - Scroll the resource list by holding the middle mouse button and dragging.

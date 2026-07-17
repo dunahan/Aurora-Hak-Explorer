@@ -24,6 +24,7 @@ const MAX_TEXTURE_SIDE: u32 = 4096;
 const MAX_RECENT_ARCHIVES: usize = 8;
 const MAX_MODEL_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_EXTRACTED_MODEL_STRINGS: usize = 2_000;
+const DISPLAY_VERSION: &str = "1.0";
 
 fn main() -> eframe::Result {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -2568,8 +2569,7 @@ impl eframe::App for HakEditor {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             RichText::new(format!(
-                                "Aurora Hak Explorer (AHE) {}",
-                                env!("CARGO_PKG_VERSION")
+                                "Aurora Hak Explorer (AHE) {DISPLAY_VERSION}"
                             ))
                             .size(23.0)
                             .strong(),
