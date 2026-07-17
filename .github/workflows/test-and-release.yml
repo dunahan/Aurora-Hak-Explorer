@@ -20,19 +20,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest] #, macos-latest] # deactivated MacOS release
 
     steps:
-    - name: Code auschecken
+    - name: Check out code
       uses: actions/checkout@v4
 
-    - name: Rust Toolchain installieren
+    - name: Install the Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Rust Cache aktivieren
+    - name: Enable Rust cache
       uses: swatinem/rust-cache@v2
 
-    - name: Tests ausführen
+    - name: Run tests
       run: cargo test --verbose
 
   # JOB 2: Build & Release
@@ -54,37 +54,37 @@ jobs:
           - os: windows-latest
             artifact_name: aurora-hak-explorer.exe
             asset_name: aurora-hak-explorer-windows.zip
-          - os: macos-latest
-            artifact_name: aurora-hak-explorer
-            asset_name: aurora-hak-explorer-macos.tar.gz
+#         - os: macos-latest                              # deactivated MacOS release
+#           artifact_name: aurora-hak-explorer
+#           asset_name: aurora-hak-explorer-macos.tar.gz
 
     steps:
-    - name: Code auschecken
+    - name: Check out code
       uses: actions/checkout@v4
 
-    - name: Rust Toolchain installieren
+    - name: Install the Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Rust Cache aktivieren
+    - name: Enable Rust cache
       uses: swatinem/rust-cache@v2
 
-    - name: Release-Build erstellen
+    - name: Create release build
       run: cargo build --release
 
     # Platform-specific packaging
-    - name: Paketieren (Windows)
+    - name: Packaging (Windows)
       if: matrix.os == 'windows-latest'
       shell: pwsh
       run: |
         Compress-Archive -Path target/release/${{ matrix.artifact_name }} -DestinationPath ./${{ matrix.asset_name }}
 
-    - name: Paketieren (Linux & macOS)
+    - name: Packaging (Linux & macOS)
       if: matrix.os != 'windows-latest'
       run: |
         tar -czf ./${{ matrix.asset_name }} -C target/release ${{ matrix.artifact_name }}
 
     # Uploads the finished file and creates a release with a sequential number
-    - name: GitHub Release automatisch erstellen
+    - name: Automatically create a GitHub release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: "build-${{ github.run_number }}"
