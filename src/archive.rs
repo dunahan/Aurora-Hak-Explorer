@@ -418,6 +418,7 @@ impl Archive {
         })
     }
 
+    #[cfg(test)]
     pub fn add_file(&mut self, path: impl AsRef<Path>) -> io::Result<bool> {
         let entry = self.entry_from_file(path.as_ref())?;
         let replacement = self.entries.iter().position(|existing| {
@@ -434,6 +435,51 @@ impl Archive {
         Ok(replacement.is_some())
     }
 
+    /// Returns the archive key and display filename an incoming resource would use.
+    /// This lets the UI build one lookup table for a large import instead of
+    /// repeatedly scanning every entry already in the archive.
+    pub fn incoming_file_identity(&self, path: impl AsRef<Path>) -> io::Result<(String, u16)> {
+        let entry = self.entry_from_file(path.as_ref())?;
+        Ok((entry.name.to_ascii_lowercase(), entry.type_id))
+    }
+
+    /// Adds or replaces one resource without sorting or bumping the view
+    /// revision. Call `finish_bulk_add` once after the complete batch.
+    pub fn add_file_unsorted(
+        &mut self,
+        path: impl AsRef<Path>,
+        replacement_index: Option<usize>,
+    ) -> io::Result<bool> {
+        let entry = self.entry_from_file(path.as_ref())?;
+        if let Some(index) = replacement_index {
+            let existing = self
+                .entries
+                .get_mut(index)
+                .ok_or_else(|| invalid("bulk import replacement index is out of range"))?;
+            if !existing.name.eq_ignore_ascii_case(&entry.name) || existing.type_id != entry.type_id
+            {
+                return Err(invalid("bulk import replacement no longer matches"));
+            }
+            *existing = entry;
+            Ok(true)
+        } else {
+            if self.entries.len() >= MAX_ARCHIVE_ENTRIES {
+                return Err(invalid(format!(
+                    "archive entry count exceeds safety limit ({MAX_ARCHIVE_ENTRIES})"
+                )));
+            }
+            self.entries.push(entry);
+            Ok(false)
+        }
+    }
+
+    pub fn finish_bulk_add(&mut self) {
+        self.entries
+            .sort_by_key(|entry| (entry.name.to_ascii_lowercase(), entry.type_id));
+        self.mark_resources_changed();
+    }
+
+    #[cfg(test)]
     pub fn conflicting_filename(&self, path: impl AsRef<Path>) -> io::Result<Option<String>> {
         let incoming = self.entry_from_file(path.as_ref())?;
         Ok(self
@@ -872,5 +918,30 @@ mod tests {
         other.add_file(&texture).unwrap();
         assert_eq!(archive.merge(&other), (1, 0));
         assert_eq!(archive.view_key(), (identity, revision + 3));
+    }
+
+    #[test]
+    fn bulk_add_defers_sorting_and_revision_until_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let second = dir.path().join("second.txt");
+        let first = dir.path().join("first.txt");
+        fs::write(&second, b"second").unwrap();
+        fs::write(&first, b"first").unwrap();
+
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        let initial_key = archive.view_key();
+        assert!(!archive.add_file_unsorted(&second, None).unwrap());
+        assert!(!archive.add_file_unsorted(&first, None).unwrap());
+        assert_eq!(archive.entries[0].name, "second");
+        assert_eq!(archive.view_key(), initial_key);
+
+        archive.finish_bulk_add();
+        assert_eq!(archive.entries[0].name, "first");
+        assert_eq!(archive.view_key(), (initial_key.0, initial_key.1 + 1));
+
+        fs::write(&first, b"replacement").unwrap();
+        assert!(archive.add_file_unsorted(&first, Some(0)).unwrap());
+        archive.finish_bulk_add();
+        assert_eq!(archive.entries[0].read_prefix(64).unwrap(), b"replacement");
     }
 }

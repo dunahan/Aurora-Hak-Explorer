@@ -9,6 +9,7 @@ mod drag_out;
 mod game_resources;
 mod mdl;
 mod resource_types;
+mod single_instance;
 
 use archive::{Archive, ArchiveKind, ArchiveVersion};
 use eframe::egui::{self, Color32, RichText};
@@ -30,6 +31,8 @@ const MAX_RECENT_ARCHIVES: usize = 8;
 const MAX_MODEL_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_MODEL_RENDER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_EXTRACTED_MODEL_STRINGS: usize = 2_000;
+const IMPORT_FILES_PER_FRAME: usize = 256;
+const MAX_DROPPED_DIRECTORY_FILES: usize = 1_000_000;
 const DISPLAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 type TextureDependencies = BTreeMap<String, Vec<archive::Entry>>;
 type TextureDependencyResult = (PathBuf, TextureDependencies);
@@ -81,6 +84,10 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    let incoming_paths = match single_instance::route(&arguments) {
+        single_instance::Launch::Forwarded => return Ok(()),
+        single_instance::Launch::Primary(receiver) => receiver,
+    };
     #[allow(unused_mut)]
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1050.0, 700.0])
@@ -107,6 +114,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut editor = HakEditor::new(cc);
+            editor.incoming_paths = Some(incoming_paths);
             for path in arguments.iter().filter(|path| path.is_file()) {
                 editor.open_path(path.clone());
             }
@@ -146,7 +154,9 @@ struct HakEditor {
     selection_cursor: Option<usize>,
     hovered_drop_files: Vec<String>,
     pending_drop_files: Vec<PathBuf>,
+    incoming_paths: Option<mpsc::Receiver<Vec<PathBuf>>>,
     internal_drag_origins: BTreeMap<PathBuf, InternalDragOrigin>,
+    tab_drop_rects: Vec<(usize, egui::Rect)>,
     typeahead: String,
     typeahead_last: Option<Instant>,
     typeahead_pending: bool,
@@ -311,6 +321,7 @@ enum ClipboardCommand {
 struct AddConflict {
     path: PathBuf,
     existing_filename: String,
+    replacement_index: usize,
 }
 
 #[derive(Clone)]
@@ -328,10 +339,22 @@ struct AddBatch {
     replaced: usize,
     skipped: usize,
     failures: Vec<String>,
+    entry_lookup: BTreeMap<(String, u16), usize>,
 }
 
 impl AddBatch {
-    fn new(paths: Vec<PathBuf>, target_tab: usize, selected_keys: BTreeSet<(String, u16)>) -> Self {
+    fn new(
+        paths: Vec<PathBuf>,
+        target_tab: usize,
+        selected_keys: BTreeSet<(String, u16)>,
+        archive: &Archive,
+    ) -> Self {
+        let entry_lookup = archive
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| ((entry.name.to_ascii_lowercase(), entry.type_id), index))
+            .collect();
         Self {
             target_tab,
             selected_keys,
@@ -342,6 +365,7 @@ impl AddBatch {
             replaced: 0,
             skipped: 0,
             failures: Vec::new(),
+            entry_lookup,
         }
     }
 }
@@ -439,7 +463,9 @@ impl HakEditor {
             selection_cursor: None,
             hovered_drop_files: Vec::new(),
             pending_drop_files: Vec::new(),
+            incoming_paths: None,
             internal_drag_origins: BTreeMap::new(),
+            tab_drop_rects: Vec::new(),
             typeahead: String::new(),
             typeahead_last: None,
             typeahead_pending: false,
@@ -1175,6 +1201,14 @@ impl HakEditor {
     }
     fn request_quit(&mut self) {
         if let Some(batch) = self.pending_add.take() {
+            if batch.added + batch.replaced > 0 {
+                if let Some(archive) = self.archive.as_mut() {
+                    archive.finish_bulk_add();
+                }
+                self.dirty = true;
+                let selected_keys = batch.selected_keys.clone();
+                self.restore_selection_by_keys(&selected_keys);
+            }
             self.status = format!(
                 "Import canceled — added {}, replaced {}, skipped {}",
                 batch.added, batch.replaced, batch.skipped
@@ -1347,7 +1381,10 @@ impl HakEditor {
             return;
         };
         let selected_keys = self.selected_resource_keys();
-        let mut batch = AddBatch::new(paths, target_tab, selected_keys);
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        let mut batch = AddBatch::new(paths, target_tab, selected_keys, archive);
         batch.skipped = same_archive_skipped;
         self.pending_add = Some(batch);
         self.process_add_batch(ConflictAction::Continue);
@@ -1370,10 +1407,22 @@ impl HakEditor {
 
         if let Some(conflict) = batch.conflict.take() {
             match action {
-                ConflictAction::Replace => add_incoming(archive, &mut batch, conflict.path),
+                ConflictAction::Replace => {
+                    add_incoming(
+                        archive,
+                        &mut batch,
+                        conflict.path,
+                        Some(conflict.replacement_index),
+                    );
+                }
                 ConflictAction::ReplaceAll => {
                     batch.policy = ConflictPolicy::ReplaceAll;
-                    add_incoming(archive, &mut batch, conflict.path);
+                    add_incoming(
+                        archive,
+                        &mut batch,
+                        conflict.path,
+                        Some(conflict.replacement_index),
+                    );
                 }
                 ConflictAction::Skip => batch.skipped += 1,
                 ConflictAction::SkipAll => {
@@ -1387,32 +1436,46 @@ impl HakEditor {
             }
         }
 
-        while !canceled && batch.conflict.is_none() {
+        let mut processed = 0;
+        while !canceled && batch.conflict.is_none() && processed < IMPORT_FILES_PER_FRAME {
             let Some(path) = batch.queue.pop_front() else {
                 break;
             };
-            match archive.conflicting_filename(&path) {
-                Ok(Some(existing_filename)) => match batch.policy {
-                    ConflictPolicy::Ask => {
-                        batch.conflict = Some(AddConflict {
-                            path,
-                            existing_filename,
-                        });
+            processed += 1;
+            match archive.incoming_file_identity(&path) {
+                Ok(key) => match batch.entry_lookup.get(&key).copied() {
+                    Some(replacement_index) => match batch.policy {
+                        ConflictPolicy::Ask => {
+                            batch.conflict = Some(AddConflict {
+                                path,
+                                existing_filename: archive.entries[replacement_index].filename(),
+                                replacement_index,
+                            });
+                        }
+                        ConflictPolicy::ReplaceAll => {
+                            add_incoming(archive, &mut batch, path, Some(replacement_index));
+                        }
+                        ConflictPolicy::SkipAll => batch.skipped += 1,
+                    },
+                    None => {
+                        let new_index = archive.entries.len();
+                        if add_incoming(archive, &mut batch, path, None) {
+                            batch.entry_lookup.insert(key, new_index);
+                        }
                     }
-                    ConflictPolicy::ReplaceAll => add_incoming(archive, &mut batch, path),
-                    ConflictPolicy::SkipAll => batch.skipped += 1,
                 },
-                Ok(None) => add_incoming(archive, &mut batch, path),
                 Err(error) => batch.failures.push(format!("{}: {error}", path.display())),
             }
         }
 
         let changed = batch.added + batch.replaced > 0;
+        let finished = canceled || (batch.conflict.is_none() && batch.queue.is_empty());
+        if finished && changed {
+            archive.finish_bulk_add();
+        }
         self.dirty |= changed;
         if changed {
             self.image_preview = None;
-            let selected_keys = batch.selected_keys.clone();
-            self.restore_selection_by_keys(&selected_keys);
         }
         if batch.conflict.is_some() {
             self.status = format!(
@@ -1420,7 +1483,20 @@ impl HakEditor {
                 batch.added, batch.replaced, batch.skipped
             );
             self.pending_add = Some(batch);
+        } else if !finished {
+            self.status = format!(
+                "Importing resources — added {}, replaced {}, skipped {}, {} remaining",
+                batch.added,
+                batch.replaced,
+                batch.skipped,
+                batch.queue.len()
+            );
+            self.pending_add = Some(batch);
         } else {
+            if changed {
+                let selected_keys = batch.selected_keys.clone();
+                self.restore_selection_by_keys(&selected_keys);
+            }
             self.status = if canceled {
                 format!(
                     "Import canceled — added {}, replaced {}, skipped {}",
@@ -1433,7 +1509,7 @@ impl HakEditor {
                 )
             };
             if !batch.failures.is_empty() {
-                self.error = Some(batch.failures.join("\n"));
+                self.error = Some(summarize_import_failures(&batch.failures));
             }
         }
     }
@@ -1585,11 +1661,41 @@ impl HakEditor {
                 return;
             }
         };
-        let sources: Result<Vec<(String, Vec<u8>)>, String> = model_indices
-            .iter()
-            .map(|index| {
-                let entry = &archive.entries[*index];
-                let filename = entry.safe_filename().map_err(|error| error.to_string())?;
+        let mut dependency_resolver = ModelDependencyResolver::new(archive, &self.tabs);
+
+        let mut exported = 0usize;
+        let mut skipped = 0usize;
+        let report_path = directory.as_ref().map(|directory| {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_millis());
+            directory.join(format!("AHE-model-compilation-failures-{timestamp}.txt"))
+        });
+        let mut failure_report = None;
+        let mut fatal_failure = None;
+        for index in model_indices {
+            let entry = &archive.entries[index];
+            let filename = match entry.safe_filename() {
+                Ok(filename) => filename,
+                Err(error) => {
+                    let message = format!("{}: {error}", entry.filename());
+                    if let Some(report_path) = report_path.as_ref() {
+                        skipped += 1;
+                        if let Err(error) = append_model_compilation_failure(
+                            &mut failure_report,
+                            report_path,
+                            &message,
+                        ) {
+                            fatal_failure = Some(error);
+                            break;
+                        }
+                        continue;
+                    }
+                    fatal_failure = Some(message);
+                    break;
+                }
+            };
+            let result = (|| -> Result<PathBuf, String> {
                 let size = entry.size().map_err(|error| error.to_string())?;
                 if size > MAX_MODEL_RENDER_BYTES {
                     return Err(format!(
@@ -1598,78 +1704,84 @@ impl HakEditor {
                         human_size(MAX_MODEL_RENDER_BYTES)
                     ));
                 }
-                let bytes = entry.read_prefix(size).map_err(|error| error.to_string())?;
-                Ok((filename, bytes))
-            })
-            .collect();
-        let sources = match sources {
-            Ok(sources) => sources,
-            Err(error) => {
-                self.fail("Could not compile model", error);
-                return;
-            }
-        };
-        let workspace = match tempfile::Builder::new()
-            .prefix("ahe-model-compile-")
-            .tempdir()
-        {
-            Ok(workspace) => workspace,
-            Err(error) => {
-                self.fail("Could not prepare model compiler", error);
-                return;
-            }
-        };
-        let mut dependency_resolver = ModelDependencyResolver::new(archive, &self.tabs);
-
-        let mut exported = 0usize;
-        let mut failure = None;
-        for (ordinal, (filename, source)) in sources.iter().enumerate() {
-            let model_workspace = workspace.path().join(format!("model-{ordinal}"));
-            let result = (|| -> Result<PathBuf, String> {
-                fs::create_dir(&model_workspace).map_err(|error| error.to_string())?;
-                // Make the other selected ASCII models available as local
-                // supermodel dependencies while compiling this model.
-                for (dependency_name, dependency_source) in &sources {
-                    fs::write(model_workspace.join(dependency_name), dependency_source)
-                        .map_err(|error| error.to_string())?;
-                }
+                // Read and stage only the current model. Its exact recursive
+                // supermodel chain is resolved below from the current/open
+                // archives and game resources. The workspace is deleted at
+                // the end of this iteration, keeping temporary disk usage
+                // bounded even for selections containing hundreds of
+                // thousands of models.
+                let source = entry.read_prefix(size).map_err(|error| error.to_string())?;
+                let model_workspace = tempfile::Builder::new()
+                    .prefix("ahe-model-compile-")
+                    .tempdir()
+                    .map_err(|error| format!("could not prepare model workspace: {error}"))?;
                 let mut staged_dependencies = BTreeSet::new();
                 staged_dependencies.insert(
                     filename
                         .strip_suffix(".mdl")
-                        .unwrap_or(filename)
+                        .unwrap_or(&filename)
                         .to_ascii_lowercase(),
                 );
                 let _resolved_dependencies = stage_model_dependencies(
                     &mut dependency_resolver,
-                    source,
-                    &model_workspace,
+                    &source,
+                    model_workspace.path(),
                     &mut staged_dependencies,
                 )?;
-                let input = model_workspace.join(format!("{filename}.ascii"));
+                let input = model_workspace.path().join(format!("{filename}.ascii"));
                 fs::write(&input, source).map_err(|error| error.to_string())?;
-                let compiled = run_model_compiler(&compiler.path, &model_workspace, &input)?;
+                let compiled = run_model_compiler(&compiler.path, model_workspace.path(), &input)?;
                 let destination = single_path
                     .clone()
-                    .unwrap_or_else(|| directory.as_ref().unwrap().join(filename));
+                    .unwrap_or_else(|| directory.as_ref().unwrap().join(&filename));
                 fs::copy(&compiled, &destination).map_err(|error| error.to_string())?;
                 Ok(destination)
             })();
             match result {
                 Ok(_) => exported += 1,
                 Err(error) => {
-                    failure = Some(format!("{filename}: {error}"));
-                    break;
+                    let message = format!("{filename}: {error}");
+                    if let Some(report_path) = report_path.as_ref() {
+                        skipped += 1;
+                        if let Err(error) = append_model_compilation_failure(
+                            &mut failure_report,
+                            report_path,
+                            &message,
+                        ) {
+                            fatal_failure = Some(error);
+                            break;
+                        }
+                    } else {
+                        fatal_failure = Some(message);
+                        break;
+                    }
                 }
             }
         }
+        if let Some(report) = failure_report.as_mut()
+            && let Err(error) = std::io::Write::flush(report)
+        {
+            fatal_failure = Some(format!("could not finish the failure report: {error}"));
+        }
         drop(dependency_resolver);
-        if let Some(error) = failure {
+        if let Some(error) = fatal_failure {
             self.fail("Could not compile model", error);
         } else if let Some(path) = single_path {
             self.status = format!("Compiled model to {}", path.display());
         } else if let Some(directory) = directory {
-            self.status = format!("Compiled {exported} models to {}", directory.display());
+            if skipped == 0 {
+                self.status = format!("Compiled {exported} models to {}", directory.display());
+            } else {
+                let report_path = report_path.expect("bulk compilation has a report path");
+                self.status = format!(
+                    "Compiled {exported} models, skipped {skipped} — report: {}",
+                    report_path.display()
+                );
+                self.error = Some(format!(
+                    "Compilation completed with skipped models.\n\nCompiled: {exported}\nSkipped: {skipped}\n\nFailure report:\n{}",
+                    report_path.display()
+                ));
+            }
         }
     }
 
@@ -2015,6 +2127,24 @@ impl eframe::App for HakEditor {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_texture_dependencies();
+        if self
+            .pending_add
+            .as_ref()
+            .is_some_and(|batch| batch.conflict.is_none())
+        {
+            self.process_add_batch(ConflictAction::Continue);
+            ctx.request_repaint();
+        }
+        let forwarded_messages = self
+            .incoming_paths
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let activation_requested = !forwarded_messages.is_empty();
+        let forwarded = forwarded_messages.into_iter().flatten().collect::<Vec<_>>();
+        if !forwarded.is_empty() {
+            self.pending_drop_files.extend(forwarded);
+        }
         self.hovered_drop_files = ctx.input(|input| {
             input
                 .raw
@@ -2028,17 +2158,38 @@ impl eframe::App for HakEditor {
                         .unwrap_or("file")
                         .to_owned()
                 })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect()
         });
         let dropped: Vec<PathBuf> = ctx
             .input(|input| input.raw.dropped_files.clone())
             .into_iter()
             .filter_map(|file| file.path)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         if !dropped.is_empty() {
+            if let Some(position) = native_drag_local_position(ctx)
+                && let Some(index) = self
+                    .tab_drop_rects
+                    .iter()
+                    .find_map(|(index, rect)| rect.contains(position).then_some(*index))
+                && self.active_tab != Some(index)
+            {
+                self.switch_tab(index);
+            }
             self.pending_drop_files.extend(dropped);
             ctx.request_repaint();
         }
+        if activation_requested || !self.pending_drop_files.is_empty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+        }
+        // The IPC listener is deliberately independent of the UI thread.
+        // Poll it at a low rate so a file-manager launch can wake an otherwise
+        // idle window without keeping the application busy.
+        ctx.request_repaint_after(Duration::from_millis(200));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -2053,13 +2204,31 @@ impl eframe::App for HakEditor {
         }
         if !self.blocking_dialog_open() && !self.pending_drop_files.is_empty() {
             let dropped = std::mem::take(&mut self.pending_drop_files);
-            let (archives, resources): (Vec<_>, Vec<_>) =
-                dropped.into_iter().partition(|path| is_archive_path(path));
+            let mut archives = Vec::new();
+            let mut resources = Vec::new();
+            let mut directory_failures = Vec::new();
+            for path in dropped {
+                if path.is_dir() {
+                    match files_in_dropped_directory(&path) {
+                        Ok(mut files) => resources.append(&mut files),
+                        Err(error) => {
+                            directory_failures.push(format!("{}: {error}", path.display()))
+                        }
+                    }
+                } else if is_archive_path(&path) {
+                    archives.push(path);
+                } else {
+                    resources.push(path);
+                }
+            }
             for path in archives {
                 self.open_path(path);
             }
             if !resources.is_empty() {
                 self.add_paths(resources);
+            }
+            if !directory_failures.is_empty() {
+                self.error = Some(directory_failures.join("\n"));
             }
         }
         if !self.blocking_dialog_open() && !self.hovered_drop_files.is_empty() {
@@ -2070,7 +2239,7 @@ impl eframe::App for HakEditor {
                     egui::Frame::popup(ui.style())
                         .inner_margin(32.0)
                         .show(ui, |ui| {
-                            ui.heading("Drop files to add to this archive");
+                            ui.heading("Drop files or folders to add to this archive");
                             ui.label(format!("{} file(s) ready", self.hovered_drop_files.len()));
                             for name in self.hovered_drop_files.iter().take(5) {
                                 ui.label(name);
@@ -2252,6 +2421,10 @@ impl eframe::App for HakEditor {
                 .then(|| input.pointer.hover_pos())
                 .flatten()
         });
+        let native_drag_position = (!self.hovered_drop_files.is_empty())
+            .then(|| native_drag_local_position(&ctx))
+            .flatten();
+        self.tab_drop_rects.clear();
         egui::Panel::top("document_tabs").show(ui, |ui| {
             // Keep the horizontal scrollbar in its own row so it cannot cover
             // the lower edge of the archive tabs when many tabs are open.
@@ -2387,6 +2560,7 @@ impl eframe::App for HakEditor {
                                     })
                                     .inner
                                 });
+                            self.tab_drop_rects.push((index, tab.response.rect));
                             if active {
                                 ui.painter().line_segment(
                                     [
@@ -2416,6 +2590,12 @@ impl eframe::App for HakEditor {
                                 }
                             });
                             if tab.inner.0.clicked() {
+                                requested_switch = Some(index);
+                            }
+                            if native_drag_position
+                                .is_some_and(|position| tab.response.rect.contains(position))
+                                && !active
+                            {
                                 requested_switch = Some(index);
                             }
                             if tab.inner.1.clicked() {
@@ -4027,6 +4207,26 @@ fn run_model_compiler(compiler: &Path, workspace: &Path, input: &Path) -> Result
     Ok(output_path)
 }
 
+fn append_model_compilation_failure(
+    report: &mut Option<std::io::BufWriter<fs::File>>,
+    report_path: &Path,
+    message: &str,
+) -> Result<(), String> {
+    if report.is_none() {
+        let file = fs::File::create(report_path).map_err(|error| {
+            format!(
+                "could not create compilation failure report {}: {error}",
+                report_path.display()
+            )
+        })?;
+        *report = Some(std::io::BufWriter::new(file));
+    }
+    let writer = report.as_mut().expect("failure report was initialized");
+    std::io::Write::write_all(writer, message.as_bytes())
+        .and_then(|()| std::io::Write::write_all(writer, b"\n"))
+        .map_err(|error| format!("could not write compilation failure report: {error}"))
+}
+
 fn compiler_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
     let mut diagnostics = String::from_utf8_lossy(stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(stderr);
@@ -4057,12 +4257,67 @@ fn valid_compiled_model(bytes: &[u8]) -> bool {
         .is_some_and(|size| size <= bytes.len())
 }
 
-fn add_incoming(archive: &mut Archive, batch: &mut AddBatch, path: PathBuf) {
-    match archive.add_file(&path) {
-        Ok(true) => batch.replaced += 1,
-        Ok(false) => batch.added += 1,
-        Err(error) => batch.failures.push(format!("{}: {error}", path.display())),
+fn files_in_dropped_directory(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut directories = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(entry.path());
+            } else if file_type.is_file() {
+                files.push(entry.path());
+                if files.len() > MAX_DROPPED_DIRECTORY_FILES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("directory contains more than {MAX_DROPPED_DIRECTORY_FILES} files"),
+                    ));
+                }
+            }
+        }
     }
+    files.sort();
+    Ok(files)
+}
+
+fn add_incoming(
+    archive: &mut Archive,
+    batch: &mut AddBatch,
+    path: PathBuf,
+    replacement_index: Option<usize>,
+) -> bool {
+    match archive.add_file_unsorted(&path, replacement_index) {
+        Ok(true) => {
+            batch.replaced += 1;
+            true
+        }
+        Ok(false) => {
+            batch.added += 1;
+            true
+        }
+        Err(error) => {
+            batch.failures.push(format!("{}: {error}", path.display()));
+            false
+        }
+    }
+}
+
+fn summarize_import_failures(failures: &[String]) -> String {
+    const SHOWN_FAILURES: usize = 25;
+    let mut message = failures
+        .iter()
+        .take(SHOWN_FAILURES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if failures.len() > SHOWN_FAILURES {
+        message.push_str(&format!(
+            "\n… and {} more file(s) could not be imported",
+            failures.len() - SHOWN_FAILURES
+        ));
+    }
+    message
 }
 
 #[cfg(target_os = "linux")]
@@ -4120,6 +4375,16 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+fn native_drag_local_position(ctx: &egui::Context) -> Option<egui::Pos2> {
+    let (x, y) = drag_out::pointer_position()?;
+    let window_origin = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.min))?;
+    let pixels_per_point = ctx.pixels_per_point();
+    Some(egui::pos2(
+        x as f32 / pixels_per_point - window_origin.x,
+        y as f32 / pixels_per_point - window_origin.y,
+    ))
 }
 
 fn resource_tree_row(ui: &mut egui::Ui, active: bool, label: &str, count: usize) -> egui::Response {
@@ -5331,6 +5596,20 @@ mod clipboard_tests {
         assert!(internal_drag_returns_to_source(&origin, Some(3)));
         assert!(!internal_drag_returns_to_source(&origin, Some(2)));
         assert!(!internal_drag_returns_to_source(&origin, None));
+    }
+
+    #[test]
+    fn dropped_directories_expand_to_their_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        let first = directory.path().join("first.mdl");
+        let second = nested.join("second.dds");
+        fs::write(&first, b"model").unwrap();
+        fs::write(&second, b"texture").unwrap();
+
+        let files = files_in_dropped_directory(directory.path()).unwrap();
+        assert_eq!(files, vec![first, second]);
     }
 
     #[test]

@@ -16,11 +16,13 @@ tempfile = "3.23"
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 x11-dl = "2.21"
 x11rb = "0.13"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 drag = "2.1.1"
+uds_windows = "1.2.1"
 windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [build-dependencies]
@@ -33,6 +35,7 @@ embed-resource = "3.0"
 [patch.crates-io]
 drag = { path = "vendor/drag" }
 wayland-scanner = { path = "vendor/wayland-scanner" }
+winit = { path = "vendor/winit" }
 
 [profile.release]
 lto = false

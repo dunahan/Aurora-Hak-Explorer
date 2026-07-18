@@ -9,10 +9,26 @@ use std::{
     collections::VecDeque,
     os::unix::ffi::OsStrExt,
     path::PathBuf,
-    sync::{OnceLock, mpsc},
+    sync::{
+        OnceLock,
+        atomic::{AtomicI64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
+
+const NO_POINTER_POSITION: i64 = i64::MIN;
+static POINTER_POSITION: AtomicI64 = AtomicI64::new(NO_POINTER_POSITION);
+
+pub fn pointer_position() -> Option<(i32, i32)> {
+    let packed = POINTER_POSITION.load(Ordering::Relaxed);
+    (packed != NO_POINTER_POSITION).then_some(((packed >> 32) as i32, packed as i32))
+}
+
+fn set_pointer_position(x: i32, y: i32) {
+    POINTER_POSITION.store(((x as i64) << 32) | y as u32 as i64, Ordering::Relaxed);
+}
 
 use tempfile::TempDir;
 use x11rb::{
@@ -158,6 +174,7 @@ fn retain_temporary_directory(directory: TempDir) {
 }
 
 fn run(paths: Vec<PathBuf>) -> Result<(), String> {
+    POINTER_POSITION.store(NO_POINTER_POSITION, Ordering::Relaxed);
     let (connection, screen_number) = x11rb::connect(None).map_err(|error| error.to_string())?;
     let root = connection.setup().roots[screen_number].root;
     let source = connection
@@ -237,6 +254,7 @@ fn run(paths: Vec<PathBuf>) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         match event {
             Event::MotionNotify(event) => {
+                set_pointer_position(event.root_x.into(), event.root_y.into());
                 last_time = event.time;
                 let next = find_target(&connection, root, atoms.xdnd_aware)?;
                 if next != target {
