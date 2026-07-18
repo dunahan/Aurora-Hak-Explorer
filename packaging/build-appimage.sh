@@ -3,11 +3,17 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml" | head -1)"
-binary="${1:-$root/target/release/aurora-hak-explorer}"
+if [[ $# -ge 1 ]]; then
+  binary="$1"
+else
+  binary="$root/target-portable/x86_64-unknown-linux-gnu/release/aurora-hak-explorer"
+  "$root/packaging/build-portable-linux-binary.sh" >/dev/null
+fi
 output="${2:-$root/build/Aurora-Hak-Explorer-${version}-x86_64.AppImage}"
 appimagetool="${APPIMAGETOOL:-$HOME/Desktop/Aurora-TLK-Explorer/dist/tools/appimagetool-x86_64.AppImage}"
 
 test -x "$binary"
+"$root/packaging/check-linux-portability.sh" "$binary"
 test -x "$root/tools/linux/nwnmdlcomp"
 test -x "$appimagetool"
 mkdir -p "$root/build"

@@ -2,6 +2,15 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.2.0 — 2026-07-19
+
+- Keep resource browsing responsive in very large archives by caching metadata, filtering, and sorting while drawing only visible rows.
+- Resolve model supermodel chains from open and sibling HAKs, override and development folders, and installed NWN KEY/BIF data so skinmeshes can be compiled without launching the game.
+- Support dotted extension searches such as `.nss`, `.dds`, and `.tga`.
+- Correct distant keyboard and type-ahead jumps in the virtualized resource list.
+- Resolve Enhanced Edition MTR diffuse textures across sibling HAKs and preserve valid model geometry in textured previews.
+- Build Linux releases against glibc 2.17 and reject non-portable binaries during AppImage packaging.
+
 ## 1.1.0 — 2026-07-18
 
 - Render compiled and uncompiled Aurora MDL geometry in the Details pane, with PLT, TGA, and DDS textures resolved from the open archive and nearby HAKs.

@@ -2,7 +2,10 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::resource_types::{extension_for, type_for};
@@ -10,6 +13,7 @@ use crate::resource_types::{extension_for, type_for};
 const HEADER_SIZE: u64 = 160;
 const MAX_ARCHIVE_ENTRIES: usize = 1_000_000;
 const MAX_LOCALIZED_STRING_TABLE_SIZE: u64 = 64 * 1024 * 1024;
+static NEXT_ARCHIVE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveVersion {
@@ -168,6 +172,8 @@ pub struct Archive {
     pub entries: Vec<Entry>,
     localized: Vec<LocalizedString>,
     description_strref: u32,
+    identity: u64,
+    view_revision: u64,
 }
 
 impl Archive {
@@ -187,7 +193,17 @@ impl Archive {
                 bytes: description,
             }],
             description_strref: u32::MAX,
+            identity: NEXT_ARCHIVE_ID.fetch_add(1, Ordering::Relaxed),
+            view_revision: 0,
         }
+    }
+
+    pub fn view_key(&self) -> (u64, u64) {
+        (self.identity, self.view_revision)
+    }
+
+    pub fn mark_resources_changed(&mut self) {
+        self.view_revision = self.view_revision.wrapping_add(1);
     }
 
     pub fn description(&self) -> String {
@@ -397,6 +413,8 @@ impl Archive {
             entries,
             localized,
             description_strref,
+            identity: NEXT_ARCHIVE_ID.fetch_add(1, Ordering::Relaxed),
+            view_revision: 0,
         })
     }
 
@@ -412,6 +430,7 @@ impl Archive {
         }
         self.entries
             .sort_by_key(|entry| (entry.name.to_ascii_lowercase(), entry.type_id));
+        self.mark_resources_changed();
         Ok(replacement.is_some())
     }
 
@@ -466,6 +485,9 @@ impl Archive {
         }
         self.entries
             .sort_by_key(|e| (e.name.to_ascii_lowercase(), e.type_id));
+        if added + replaced > 0 {
+            self.mark_resources_changed();
+        }
         (added, replaced)
     }
 
@@ -827,5 +849,28 @@ mod tests {
         let different_type = dir.path().join("model.dds");
         fs::write(&different_type, b"test").unwrap();
         assert_eq!(archive.conflicting_filename(different_type).unwrap(), None);
+    }
+
+    #[test]
+    fn resource_view_revision_tracks_entry_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("sample.mdl");
+        fs::write(&model, b"newmodel sample\nsetsupermodel sample NULL\n").unwrap();
+
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        let (identity, revision) = archive.view_key();
+        archive.add_file(&model).unwrap();
+        assert_eq!(archive.view_key(), (identity, revision + 1));
+
+        fs::write(&model, b"newmodel sample\nsetsupermodel sample parent\n").unwrap();
+        assert!(archive.add_file(&model).unwrap());
+        assert_eq!(archive.view_key(), (identity, revision + 2));
+
+        let mut other = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        let texture = dir.path().join("sample.dds");
+        fs::write(&texture, b"DDS test").unwrap();
+        other.add_file(&texture).unwrap();
+        assert_eq!(archive.merge(&other), (1, 0));
+        assert_eq!(archive.view_key(), (identity, revision + 3));
     }
 }

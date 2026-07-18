@@ -62,6 +62,7 @@ struct Node {
     shadow: u32,
     render: u32,
     bitmap: Option<String>,
+    material_name: Option<String>,
     vertices: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     tverts: Vec<[f32; 2]>,
@@ -292,7 +293,10 @@ impl Document {
                 faces,
                 texture_vertices: node.tverts.clone(),
                 texture_faces,
-                texture_name: node.bitmap.clone(),
+                // Enhanced Edition materials normally use the material resref
+                // as their diffuse texture name (texture0). Keep direct bitmap
+                // declarations authoritative, then fall back to the material.
+                texture_name: node.bitmap.clone().or_else(|| node.material_name.clone()),
                 color: node.diffuse.map(|value| value.clamp(0.08, 1.0)),
             });
         }
@@ -398,6 +402,9 @@ impl Node {
             let _ = writeln!(output, "  render {}", self.render);
             if let Some(bitmap) = &self.bitmap {
                 let _ = writeln!(output, "  bitmap {bitmap}");
+            }
+            if let Some(material_name) = &self.material_name {
+                let _ = writeln!(output, "  materialname {material_name}");
             }
             let _ = writeln!(output, "  verts {}", self.vertices.len());
             for vertex in &self.vertices {
@@ -560,6 +567,7 @@ fn parse_binary_node(
         shadow: 1,
         render: 1,
         bitmap: None,
+        material_name: None,
         vertices: Vec::new(),
         normals: Vec::new(),
         tverts: Vec::new(),
@@ -577,6 +585,10 @@ fn parse_binary_node(
         let bitmap = read_string(model, offset + 0xe8, 64)?;
         node.bitmap =
             (!bitmap.is_empty() && !bitmap.eq_ignore_ascii_case("null")).then_some(bitmap);
+        let material_name = read_string(model, offset + 0x1a8, 64)?;
+        node.material_name = (!material_name.is_empty()
+            && !material_name.eq_ignore_ascii_case("null"))
+        .then_some(material_name);
         let vertex_offset = read_u32(model, offset + 0x22c)?;
         let vertex_count = read_u16(model, offset + 0x230)? as usize;
         if vertex_count > MAX_VERTICES {
@@ -848,6 +860,7 @@ fn parse_ascii(bytes: &[u8]) -> Result<Document, String> {
                     shadow: 1,
                     render: 1,
                     bitmap: None,
+                    material_name: None,
                     vertices: Vec::new(),
                     normals: Vec::new(),
                     tverts: Vec::new(),
@@ -885,6 +898,9 @@ fn parse_ascii(bytes: &[u8]) -> Result<Document, String> {
                     "shadow" if values.len() >= 2 => node.shadow = values[1].parse().unwrap_or(1),
                     "render" if values.len() >= 2 => node.render = values[1].parse().unwrap_or(1),
                     "bitmap" if values.len() >= 2 => node.bitmap = Some(values[1].to_owned()),
+                    "materialname" if values.len() >= 2 => {
+                        node.material_name = Some(values[1].to_owned())
+                    }
                     "verts" if values.len() >= 2 => {
                         let count = parse_count(values[1], MAX_VERTICES)?;
                         claim_budget(&mut total_vertices, count, MAX_VERTICES, "vertices")?;
@@ -1163,6 +1179,16 @@ mod tests {
         let scene = parse_scene(source).unwrap();
         assert_eq!(scene.vertex_count, 3);
         assert_eq!(scene.face_count, 1);
+    }
+
+    #[test]
+    fn uses_enhanced_edition_material_as_texture_fallback() {
+        let source = b"newmodel material_test\nbeginmodelgeom material_test\nnode trimesh mesh\n parent NULL\n materialname cm_nazgsword\n verts 3\n 0 0 0\n 1 0 0\n 0 1 0\n faces 1\n 0 1 2 1 0 1 2 0\nendnode\nendmodelgeom material_test\ndonemodel material_test\n";
+        let scene = parse_scene(source).unwrap();
+        assert_eq!(
+            scene.meshes[0].texture_name.as_deref(),
+            Some("cm_nazgsword")
+        );
     }
 
     #[test]

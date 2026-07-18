@@ -6,6 +6,7 @@ mod drag_out;
 #[cfg(target_os = "windows")]
 #[path = "drag_out_windows.rs"]
 mod drag_out;
+mod game_resources;
 mod mdl;
 mod resource_types;
 
@@ -16,7 +17,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{OnceLock, mpsc},
+    sync::{Arc, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -29,7 +30,7 @@ const MAX_RECENT_ARCHIVES: usize = 8;
 const MAX_MODEL_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_MODEL_RENDER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_EXTRACTED_MODEL_STRINGS: usize = 2_000;
-const DISPLAY_VERSION: &str = "1.1.0";
+const DISPLAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 type TextureDependencies = BTreeMap<String, Vec<archive::Entry>>;
 type TextureDependencyResult = (PathBuf, TextureDependencies);
 
@@ -172,6 +173,7 @@ struct HakEditor {
     texture_dependency_directory: Option<PathBuf>,
     texture_dependencies: TextureDependencies,
     texture_dependency_receiver: Option<mpsc::Receiver<TextureDependencyResult>>,
+    resource_view_cache: Option<ResourceViewCache>,
 }
 
 struct ImagePreviewCache {
@@ -192,6 +194,7 @@ struct ModelPreviewCache {
     textures: BTreeMap<String, ModelTexture>,
 }
 
+#[derive(Clone)]
 struct ModelTexture {
     handle: egui::TextureHandle,
     flip_vertical: bool,
@@ -230,6 +233,30 @@ enum SortColumn {
     Name,
     Type,
     Size,
+}
+
+#[derive(Clone)]
+struct ResourceSummary {
+    categories: BTreeMap<String, usize>,
+    compiled_models: usize,
+    uncompiled_models: usize,
+    new_count: usize,
+    name: String,
+    count: usize,
+    bytes: u64,
+    version: &'static str,
+    kind: String,
+}
+
+struct ResourceViewCache {
+    archive_key: (u64, u64),
+    filter: String,
+    category: Option<String>,
+    compact_mode: bool,
+    sort_column: SortColumn,
+    sort_ascending: bool,
+    summary: ResourceSummary,
+    visible_indices: Arc<[usize]>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -433,6 +460,7 @@ impl HakEditor {
             texture_dependency_directory: None,
             texture_dependencies: BTreeMap::new(),
             texture_dependency_receiver: None,
+            resource_view_cache: None,
         }
     }
 
@@ -542,6 +570,40 @@ impl HakEditor {
                 }
             }
         }
+        // Enhanced Edition models frequently reference an MTR rather than an
+        // image directly. Resolve its diffuse texture0 before looking for the
+        // actual TGA/DDS/PLT, including MTRs found in sibling HAKs.
+        let material_names: Vec<String> = names.keys().cloned().collect();
+        let mut material_aliases = BTreeMap::new();
+        for material_name in material_names {
+            let active = self.archive.iter().flat_map(|archive| &archive.entries);
+            let open_tabs = self.tabs.iter().flat_map(|tab| &tab.archive.entries);
+            let dependencies = self
+                .texture_dependencies
+                .get(&material_name)
+                .into_iter()
+                .flatten();
+            let material = active.chain(open_tabs).chain(dependencies).find(|entry| {
+                entry.name.eq_ignore_ascii_case(&material_name)
+                    && entry.extension().eq_ignore_ascii_case("mtr")
+            });
+            let Some(texture_name) = material
+                .and_then(|entry| {
+                    entry
+                        .size()
+                        .ok()
+                        .filter(|size| *size <= 1024 * 1024)
+                        .map(|size| (entry, size))
+                })
+                .and_then(|(entry, size)| entry.read_prefix(size).ok())
+                .and_then(|bytes| mtr_diffuse_texture(&bytes))
+            else {
+                continue;
+            };
+            let texture_name = texture_name.to_ascii_lowercase();
+            names.entry(texture_name.clone()).or_insert(None);
+            material_aliases.insert(material_name, texture_name);
+        }
         let texture_rank = |extension: &str| match extension {
             "plt" => 0,
             "dds" => 1,
@@ -612,6 +674,11 @@ impl HakEditor {
                 },
             );
         }
+        for (material_name, texture_name) in material_aliases {
+            if let Some(texture) = textures.get(&texture_name).cloned() {
+                textures.insert(material_name, texture);
+            }
+        }
         textures
     }
 
@@ -650,7 +717,7 @@ impl HakEditor {
                         let extension = entry.extension();
                         if !matches!(
                             extension.as_str(),
-                            "plt" | "dds" | "tga" | "png" | "jpg" | "jpeg"
+                            "plt" | "dds" | "tga" | "png" | "jpg" | "jpeg" | "mtr"
                         ) {
                             continue;
                         }
@@ -686,6 +753,99 @@ impl HakEditor {
                 self.model_preview = None;
             }
         }
+    }
+
+    fn resource_view(&mut self) -> Option<(ResourceSummary, Arc<[usize]>)> {
+        let archive = self.archive.as_ref()?;
+        let archive_key = archive.view_key();
+        let category = (!self.compact_mode)
+            .then(|| self.category.clone())
+            .flatten();
+        let stale = self.resource_view_cache.as_ref().is_none_or(|cache| {
+            cache.archive_key != archive_key
+                || cache.filter != self.filter
+                || cache.category != category
+                || cache.compact_mode != self.compact_mode
+                || cache.sort_column != self.sort_column
+                || cache.sort_ascending != self.sort_ascending
+        });
+        if stale {
+            let mut categories = BTreeMap::<String, usize>::new();
+            let mut compiled_models = 0;
+            let mut uncompiled_models = 0;
+            let mut new_count = 0;
+            let mut bytes = 0_u64;
+            for entry in &archive.entries {
+                *categories
+                    .entry(category_for(&entry.extension()).to_owned())
+                    .or_default() += 1;
+                match entry.model_compiled() {
+                    Some(true) => compiled_models += 1,
+                    Some(false) => uncompiled_models += 1,
+                    None => {}
+                }
+                new_count += usize::from(entry.is_new());
+                bytes = bytes.saturating_add(entry.size().unwrap_or(0));
+            }
+            let summary = ResourceSummary {
+                categories,
+                compiled_models,
+                uncompiled_models,
+                new_count,
+                name: archive
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Untitled")
+                    .to_owned(),
+                count: archive.entries.len(),
+                bytes,
+                version: archive.version.label(),
+                kind: String::from_utf8_lossy(archive.kind.signature())
+                    .trim()
+                    .to_owned(),
+            };
+            let filter = self.filter.to_ascii_lowercase();
+            let mut visible_indices: Vec<usize> = archive
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    let extension = entry.extension();
+                    resource_matches_filter(&entry.name, &extension, &filter)
+                        && entry_matches_category(entry, category.as_deref())
+                })
+                .map(|(index, _)| index)
+                .collect();
+            match self.sort_column {
+                SortColumn::Name => visible_indices
+                    .sort_by_cached_key(|index| archive.entries[*index].name.to_ascii_lowercase()),
+                SortColumn::Type => visible_indices.sort_by_cached_key(|index| {
+                    let entry = &archive.entries[*index];
+                    (entry.extension(), entry.name.to_ascii_lowercase())
+                }),
+                SortColumn::Size => visible_indices.sort_by_cached_key(|index| {
+                    let entry = &archive.entries[*index];
+                    (entry.size().unwrap_or(0), entry.name.to_ascii_lowercase())
+                }),
+            }
+            if !self.sort_ascending {
+                visible_indices.reverse();
+            }
+            self.resource_view_cache = Some(ResourceViewCache {
+                archive_key,
+                filter: self.filter.clone(),
+                category,
+                compact_mode: self.compact_mode,
+                sort_column: self.sort_column,
+                sort_ascending: self.sort_ascending,
+                summary,
+                visible_indices: visible_indices.into(),
+            });
+        }
+        let cache = self.resource_view_cache.as_ref().unwrap();
+        Some((cache.summary.clone(), Arc::clone(&cache.visible_indices)))
     }
 
     fn show_model_preview(
@@ -1423,6 +1583,7 @@ impl HakEditor {
                 return;
             }
         };
+        let mut dependency_resolver = ModelDependencyResolver::new(archive, &self.tabs);
 
         let mut exported = 0usize;
         let mut failure = None;
@@ -1443,8 +1604,8 @@ impl HakEditor {
                         .unwrap_or(filename)
                         .to_ascii_lowercase(),
                 );
-                stage_model_dependencies(
-                    archive,
+                let _resolved_dependencies = stage_model_dependencies(
+                    &mut dependency_resolver,
                     source,
                     &model_workspace,
                     &mut staged_dependencies,
@@ -1466,6 +1627,7 @@ impl HakEditor {
                 }
             }
         }
+        drop(dependency_resolver);
         if let Some(error) = failure {
             self.fail("Could not compile model", error);
         } else if let Some(path) = single_path {
@@ -1710,6 +1872,7 @@ impl HakEditor {
             .filter(|(i, _)| !self.selected.contains(i))
             .map(|(_, e)| e.clone())
             .collect();
+        archive.mark_resources_changed();
         self.selected.clear();
         self.selection_anchor = None;
         self.selection_cursor = None;
@@ -2354,53 +2517,28 @@ impl eframe::App for HakEditor {
                 }
             });
         });
-        let mut categories = BTreeMap::<String, usize>::new();
-        let mut compiled_models = 0;
-        let mut uncompiled_models = 0;
-        let new_count = self
-            .archive
-            .as_ref()
-            .map(|archive| {
-                archive
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.is_new())
-                    .count()
-            })
-            .unwrap_or(0);
-        let archive_info = self.archive.as_ref().map(|a| {
-            for entry in &a.entries {
-                *categories
-                    .entry(category_for(&entry.extension()).to_owned())
-                    .or_default() += 1;
-                match entry.model_compiled() {
-                    Some(true) => compiled_models += 1,
-                    Some(false) => uncompiled_models += 1,
-                    None => {}
-                }
-            }
-            let bytes = a
-                .entries
-                .iter()
-                .filter_map(|entry| entry.size().ok())
-                .sum::<u64>();
-            let name = a
-                .path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .unwrap_or("Untitled")
-                .to_owned();
+        let resource_view = self.resource_view();
+        let archive_info = resource_view.as_ref().map(|(summary, _)| {
             (
-                name,
-                a.entries.len(),
-                bytes,
-                a.version.label(),
-                String::from_utf8_lossy(a.kind.signature())
-                    .trim()
-                    .to_owned(),
+                summary.name.clone(),
+                summary.count,
+                summary.bytes,
+                summary.version,
+                summary.kind.clone(),
             )
         });
+        let categories = resource_view
+            .as_ref()
+            .map(|(summary, _)| &summary.categories);
+        let compiled_models = resource_view
+            .as_ref()
+            .map_or(0, |(summary, _)| summary.compiled_models);
+        let uncompiled_models = resource_view
+            .as_ref()
+            .map_or(0, |(summary, _)| summary.uncompiled_models);
+        let new_count = resource_view
+            .as_ref()
+            .map_or(0, |(summary, _)| summary.new_count);
         let selected_entry = self
             .selected
             .first()
@@ -2428,7 +2566,7 @@ impl eframe::App for HakEditor {
                             self.selection_anchor = None;
                             self.selection_cursor = None;
                         }
-                        for (category, amount) in &categories {
+                        for (category, amount) in categories.into_iter().flatten() {
                             if category == "Models" {
                                 for (label, count) in [
                                     ("Models All", *amount),
@@ -2589,52 +2727,10 @@ impl eframe::App for HakEditor {
             });
             ui.separator();
             if let Some(a) = self.archive.as_ref() {
-                let filter = self.filter.to_ascii_lowercase();
-                // Compact mode deliberately ignores the tree's active category.  The tree is
-                // hidden in this mode, so leaving a prior selection such as "New" active
-                // must not make the main list look as if resources have disappeared.
-                let category = (!self.compact_mode)
-                    .then(|| self.category.clone())
-                    .flatten();
-                let mut visible_indices: Vec<usize> = a
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|entry| {
-                        let ext = entry.1.extension();
-                        (filter.is_empty()
-                            || entry.1.name.to_ascii_lowercase().contains(&filter)
-                            || ext.contains(&filter))
-                            && entry_matches_category(entry.1, category.as_deref())
-                    })
-                    .map(|(index, _)| index)
-                    .collect();
-                visible_indices.sort_by(|left, right| {
-                    let left_entry = &a.entries[*left];
-                    let right_entry = &a.entries[*right];
-                    let ordering = match self.sort_column {
-                        SortColumn::Name => left_entry
-                            .name
-                            .to_ascii_lowercase()
-                            .cmp(&right_entry.name.to_ascii_lowercase()),
-                        SortColumn::Type => left_entry.extension().cmp(&right_entry.extension()),
-                        SortColumn::Size => left_entry
-                            .size()
-                            .unwrap_or(0)
-                            .cmp(&right_entry.size().unwrap_or(0)),
-                    }
-                    .then_with(|| {
-                        left_entry
-                            .name
-                            .to_ascii_lowercase()
-                            .cmp(&right_entry.name.to_ascii_lowercase())
-                    });
-                    if self.sort_ascending {
-                        ordering
-                    } else {
-                        ordering.reverse()
-                    }
-                });
+                let visible_indices = resource_view
+                    .as_ref()
+                    .map(|(_, indices)| Arc::clone(indices))
+                    .unwrap_or_else(|| Arc::from([]));
                 if request_select_all {
                     self.selected = visible_indices.iter().copied().collect();
                     self.selection_anchor = visible_indices.first().copied();
@@ -2747,66 +2843,105 @@ impl eframe::App for HakEditor {
                 let mut request_export = false;
                 let mut request_model_export = None;
                 let mut request_drag = None;
-                let resource_scroll = egui::ScrollArea::vertical()
-                    .id_salt("resource_entries")
-                    .auto_shrink(false)
+                let type_column_width = 100.0;
+                let size_column_width = 100.0;
+                let name_column_width = (ui.available_width()
+                    - type_column_width
+                    - size_column_width
+                    - ui.spacing().item_spacing.x * 2.0)
+                    .max(100.0);
+                egui::Grid::new("entries_header")
+                    .min_col_width(100.0)
                     .show(ui, |ui| {
+                        if sort_button(
+                            ui,
+                            "Name",
+                            name_column_width,
+                            SortColumn::Name,
+                            self.sort_column,
+                            self.sort_ascending,
+                        ) {
+                            set_sort(
+                                &mut self.sort_column,
+                                &mut self.sort_ascending,
+                                SortColumn::Name,
+                            );
+                        }
+                        if sort_button(
+                            ui,
+                            "Type",
+                            type_column_width,
+                            SortColumn::Type,
+                            self.sort_column,
+                            self.sort_ascending,
+                        ) {
+                            set_sort(
+                                &mut self.sort_column,
+                                &mut self.sort_ascending,
+                                SortColumn::Type,
+                            );
+                        }
+                        if sort_button(
+                            ui,
+                            "Size",
+                            size_column_width,
+                            SortColumn::Size,
+                            self.sort_column,
+                            self.sort_ascending,
+                        ) {
+                            set_sort(
+                                &mut self.sort_column,
+                                &mut self.sort_ascending,
+                                SortColumn::Size,
+                            );
+                        }
+                        ui.end_row();
+                    });
+                let row_height = ui.spacing().interact_size.y;
+                let resource_scroll_id = ui.make_persistent_id("resource_entries");
+                let requested_scroll_offset = jump_target
+                    .or(keyboard_target)
+                    .and_then(|target| visible_indices.iter().position(|item| *item == target))
+                    .and_then(|row| {
+                        let current_offset =
+                            egui::scroll_area::State::load(&ctx, resource_scroll_id)
+                                .unwrap_or_default()
+                                .offset
+                                .y;
+                        let viewport_height = ui.available_height().max(row_height);
+                        requested_virtualized_scroll_offset(
+                            row,
+                            row_height,
+                            ui.spacing().item_spacing.y,
+                            current_offset,
+                            viewport_height,
+                        )
+                    });
+                let mut resource_scroll_area = egui::ScrollArea::vertical()
+                    .id_salt("resource_entries")
+                    .auto_shrink(false);
+                if let Some(offset) = requested_scroll_offset {
+                    resource_scroll_area = resource_scroll_area.vertical_scroll_offset(offset);
+                }
+                let resource_scroll = resource_scroll_area.show_rows(
+                    ui,
+                    row_height,
+                    visible_indices.len(),
+                    |ui, row_range| {
                         egui::Grid::new("entries")
                             .striped(true)
                             .min_col_width(100.0)
                             .show(ui, |ui| {
-                                if sort_button(
-                                    ui,
-                                    "Name",
-                                    SortColumn::Name,
-                                    self.sort_column,
-                                    self.sort_ascending,
-                                ) {
-                                    set_sort(
-                                        &mut self.sort_column,
-                                        &mut self.sort_ascending,
-                                        SortColumn::Name,
-                                    );
-                                }
-                                if sort_button(
-                                    ui,
-                                    "Type",
-                                    SortColumn::Type,
-                                    self.sort_column,
-                                    self.sort_ascending,
-                                ) {
-                                    set_sort(
-                                        &mut self.sort_column,
-                                        &mut self.sort_ascending,
-                                        SortColumn::Type,
-                                    );
-                                }
-                                if sort_button(
-                                    ui,
-                                    "Size",
-                                    SortColumn::Size,
-                                    self.sort_column,
-                                    self.sort_ascending,
-                                ) {
-                                    set_sort(
-                                        &mut self.sort_column,
-                                        &mut self.sort_ascending,
-                                        SortColumn::Size,
-                                    );
-                                }
-                                ui.end_row();
-                                for index in visible_indices.iter().copied() {
+                                for row in row_range {
+                                    let index = visible_indices[row];
                                     let entry = &a.entries[index];
                                     let ext = entry.extension();
                                     let selected = self.selected.contains(&index);
-                                    let response = ui.add(
+                                    let response = ui.add_sized(
+                                        [name_column_width, row_height],
                                         egui::Button::selectable(selected, entry.filename())
                                             .sense(egui::Sense::click_and_drag()),
                                     );
-                                    if jump_target == Some(index) || keyboard_target == Some(index)
-                                    {
-                                        response.scroll_to_me(Some(egui::Align::Center));
-                                    }
                                     if response.clicked() {
                                         self.typeahead.clear();
                                         self.typeahead_pending = false;
@@ -2927,7 +3062,8 @@ impl eframe::App for HakEditor {
                                     ui.end_row();
                                 }
                             });
-                    });
+                    },
+                );
                 let (middle_pressed, middle_down, pointer_position, pointer_delta) =
                     ctx.input(|input| {
                         (
@@ -3455,11 +3591,242 @@ fn model_export_action(entry: &archive::Entry) -> Result<ModelExportAction, Stri
     }
 }
 
+#[derive(Clone)]
+struct ModelDependency {
+    bytes: Vec<u8>,
+    origin: String,
+}
+
+struct ModelDependencyResolver<'a> {
+    archives: Vec<(&'a Archive, String)>,
+    sibling_archives: Vec<PathBuf>,
+    loose_directories: Vec<PathBuf>,
+    game_resources: game_resources::GameResourceIndex,
+    cache: BTreeMap<String, Result<ModelDependency, String>>,
+}
+
+impl<'a> ModelDependencyResolver<'a> {
+    fn new(active: &'a Archive, tabs: &'a [TabState]) -> Self {
+        let mut archives = vec![(active, "the current archive".to_owned())];
+        for tab in tabs {
+            if tab.archive.view_key().0 == active.view_key().0 {
+                continue;
+            }
+            archives.push((
+                &tab.archive,
+                tab.archive.path.as_ref().map_or_else(
+                    || "an open unsaved archive".to_owned(),
+                    |path| path.display().to_string(),
+                ),
+            ));
+        }
+
+        let open_paths: BTreeSet<PathBuf> = archives
+            .iter()
+            .filter_map(|(archive, _)| archive.path.as_ref())
+            .filter_map(|path| fs::canonicalize(path).ok())
+            .collect();
+        let mut sibling_archives = Vec::new();
+        for (archive, _) in &archives {
+            let Some(directory) = archive.path.as_ref().and_then(|path| path.parent()) else {
+                continue;
+            };
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+                if !path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("hak"))
+                {
+                    continue;
+                }
+                let canonical = fs::canonicalize(&path).unwrap_or(path);
+                if !open_paths.contains(&canonical) {
+                    sibling_archives.push(canonical);
+                }
+            }
+        }
+        sibling_archives.sort();
+        sibling_archives.dedup();
+
+        let mut document_roots = Vec::new();
+        for (archive, _) in &archives {
+            if let Some(directory) = archive.path.as_ref().and_then(|path| path.parent())
+                && directory
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("hak"))
+                && let Some(root) = directory.parent()
+            {
+                document_roots.push(root.to_path_buf());
+            }
+        }
+        if let Some(home) = home_directory() {
+            document_roots.push(home.join("Documents/Neverwinter Nights"));
+        }
+        document_roots.sort();
+        document_roots.dedup();
+
+        let mut loose_directories = std::env::var_os("AHE_MODEL_PATH")
+            .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for root in &document_roots {
+            loose_directories.push(root.join("development"));
+            loose_directories.push(root.join("override"));
+        }
+        loose_directories.retain(|path| path.is_dir());
+        loose_directories.sort();
+        loose_directories.dedup();
+
+        let install_roots = discover_nwn_installations();
+        let game_resources = game_resources::GameResourceIndex::build(&install_roots, 0x07d2);
+        Self {
+            archives,
+            sibling_archives,
+            loose_directories,
+            game_resources,
+            cache: BTreeMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, name: &str) -> Result<ModelDependency, String> {
+        let key = name.to_ascii_lowercase();
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+        let result = self.resolve_uncached(name);
+        self.cache.insert(key, result.clone());
+        result
+    }
+
+    fn resolve_uncached(&self, name: &str) -> Result<ModelDependency, String> {
+        for (archive, origin) in &self.archives {
+            if let Some(entry) = find_model_entry(archive, name) {
+                return read_model_dependency(entry, origin.clone());
+            }
+        }
+        for path in &self.sibling_archives {
+            let Ok(archive) = Archive::open(path) else {
+                continue;
+            };
+            if let Some(entry) = find_model_entry(&archive, name) {
+                return read_model_dependency(entry, path.display().to_string());
+            }
+        }
+        let filename = format!("{name}.mdl");
+        for directory in &self.loose_directories {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            let path = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.is_file()
+                        && path.file_name().is_some_and(|candidate| {
+                            candidate.to_string_lossy().eq_ignore_ascii_case(&filename)
+                        })
+                });
+            if let Some(path) = path {
+                let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+                return checked_model_dependency(bytes, path.display().to_string());
+            }
+        }
+        if let Some((bytes, path)) = self
+            .game_resources
+            .load(name, 0x07d2)
+            .map_err(|error| error.to_string())?
+        {
+            return checked_model_dependency(bytes, path.display().to_string());
+        }
+        Err(format!(
+            "required supermodel \"{name}\" was not found in the current or open archives, sibling HAKs, NWN development/override folders, or installed game data"
+        ))
+    }
+}
+
+fn find_model_entry<'a>(archive: &'a Archive, name: &str) -> Option<&'a archive::Entry> {
+    archive
+        .entries
+        .iter()
+        .find(|entry| entry.type_id == 0x07d2 && entry.name.eq_ignore_ascii_case(name))
+}
+
+fn read_model_dependency(
+    entry: &archive::Entry,
+    origin: String,
+) -> Result<ModelDependency, String> {
+    let size = entry.size().map_err(|error| error.to_string())?;
+    if size > MAX_MODEL_RENDER_BYTES {
+        return Err(format!(
+            "supermodel {} exceeds the {} compilation limit",
+            entry.filename(),
+            human_size(MAX_MODEL_RENDER_BYTES)
+        ));
+    }
+    let bytes = entry.read_prefix(size).map_err(|error| error.to_string())?;
+    checked_model_dependency(bytes, origin)
+}
+
+fn checked_model_dependency(bytes: Vec<u8>, origin: String) -> Result<ModelDependency, String> {
+    if bytes.len() as u64 > MAX_MODEL_RENDER_BYTES {
+        return Err(format!(
+            "supermodel from {origin} exceeds the {} compilation limit",
+            human_size(MAX_MODEL_RENDER_BYTES)
+        ));
+    }
+    Ok(ModelDependency { bytes, origin })
+}
+
+fn home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn discover_nwn_installations() -> Vec<PathBuf> {
+    let mut roots = std::env::var_os("AHE_NWN_INSTALL")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(home) = home_directory() {
+        roots.extend([
+            home.join(".steam/steam/steamapps/common/Neverwinter Nights"),
+            home.join(".local/share/Steam/steamapps/common/Neverwinter Nights"),
+            home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/Neverwinter Nights"),
+        ]);
+    }
+    for variable in ["PROGRAMFILES(X86)", "PROGRAMFILES"] {
+        if let Some(directory) = std::env::var_os(variable) {
+            roots.push(PathBuf::from(directory).join("Steam/steamapps/common/Neverwinter Nights"));
+        }
+    }
+    roots.retain(|path| path.is_dir());
+    roots = roots
+        .into_iter()
+        .map(|path| fs::canonicalize(&path).unwrap_or(path))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn stage_model_dependencies(
-    archive: &Archive,
+    resolver: &mut ModelDependencyResolver<'_>,
     source: &[u8],
     workspace: &Path,
     visited: &mut BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let mut origins = Vec::new();
+    stage_model_dependencies_inner(resolver, source, workspace, visited, &mut origins)?;
+    Ok(origins)
+}
+
+fn stage_model_dependencies_inner(
+    resolver: &mut ModelDependencyResolver<'_>,
+    source: &[u8],
+    workspace: &Path,
+    visited: &mut BTreeSet<String>,
+    origins: &mut Vec<String>,
 ) -> Result<(), String> {
     let text = String::from_utf8_lossy(source);
     let supermodel = text.lines().find_map(|line| {
@@ -3481,24 +3848,15 @@ fn stage_model_dependencies(
     if !visited.insert(key) {
         return Ok(());
     }
-    let entry = archive
-        .entries
-        .iter()
-        .find(|entry| entry.extension() == "mdl" && entry.name.eq_ignore_ascii_case(&supermodel))
-        .ok_or_else(|| format!("required supermodel \"{supermodel}\" is not in this archive"))?;
-    let size = entry.size().map_err(|error| error.to_string())?;
-    if size > MAX_MODEL_RENDER_BYTES {
-        return Err(format!(
-            "supermodel {} exceeds the {} compilation limit",
-            entry.filename(),
-            human_size(MAX_MODEL_RENDER_BYTES)
-        ));
-    }
-    let bytes = entry.read_prefix(size).map_err(|error| error.to_string())?;
-    let filename = entry.safe_filename().map_err(|error| error.to_string())?;
-    fs::write(workspace.join(filename), &bytes).map_err(|error| error.to_string())?;
-    if model_export_action(entry) == Ok(ModelExportAction::Compile) {
-        stage_model_dependencies(archive, &bytes, workspace, visited)?;
+    let dependency = resolver.resolve(&supermodel)?;
+    fs::write(
+        workspace.join(format!("{supermodel}.mdl")),
+        &dependency.bytes,
+    )
+    .map_err(|error| error.to_string())?;
+    origins.push(format!("{supermodel}.mdl from {}", dependency.origin));
+    if dependency.bytes.get(..4) != Some(&[0, 0, 0, 0]) {
+        stage_model_dependencies_inner(resolver, &dependency.bytes, workspace, visited, origins)?;
     }
     Ok(())
 }
@@ -3758,9 +4116,31 @@ fn resource_tree_row(ui: &mut egui::Ui, active: bool, label: &str, count: usize)
     )
 }
 
+fn resource_matches_filter(name: &str, extension: &str, filter: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    let extension_filter = filter.strip_prefix('.').unwrap_or(filter);
+    name.to_ascii_lowercase().contains(filter) || extension.contains(extension_filter)
+}
+
+fn requested_virtualized_scroll_offset(
+    row: usize,
+    row_height: f32,
+    row_spacing: f32,
+    current_offset: f32,
+    viewport_height: f32,
+) -> Option<f32> {
+    let row_top = row as f32 * (row_height + row_spacing);
+    let row_bottom = row_top + row_height;
+    (row_top < current_offset || row_bottom > current_offset + viewport_height)
+        .then_some((row_top - (viewport_height - row_height) * 0.5).max(0.0))
+}
+
 fn sort_button(
     ui: &mut egui::Ui,
     label: &str,
+    width: f32,
     column: SortColumn,
     current: SortColumn,
     ascending: bool,
@@ -3770,7 +4150,11 @@ fn sort_button(
     } else {
         ""
     };
-    ui.button(format!("{label}{arrow}")).clicked()
+    ui.add_sized(
+        [width, ui.spacing().interact_size.y],
+        egui::Button::new(format!("{label}{arrow}")),
+    )
+    .clicked()
 }
 
 fn set_sort(current: &mut SortColumn, ascending: &mut bool, requested: SortColumn) {
@@ -3843,6 +4227,19 @@ fn is_text_type(extension: &str) -> bool {
             | "tml"
             | "sql"
     )
+}
+
+fn mtr_diffuse_texture(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes).lines().find_map(|line| {
+        let line = line.split("//").next().unwrap_or_default().trim();
+        let mut fields = line.split_whitespace();
+        let directive = fields.next()?;
+        if !directive.eq_ignore_ascii_case("texture0") {
+            return None;
+        }
+        let value = fields.next()?.trim_matches('"');
+        (!value.is_empty() && !value.eq_ignore_ascii_case("null")).then(|| value.to_owned())
+    })
 }
 
 fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
@@ -4867,6 +5264,33 @@ mod clipboard_tests {
     use super::*;
 
     #[test]
+    fn dotted_extensions_match_resource_filters() {
+        assert!(resource_matches_filter("nwscript", "nss", ".nss"));
+        assert!(resource_matches_filter("texture", "dds", ".dds"));
+        assert!(resource_matches_filter("my_model", "mdl", "model"));
+        assert!(!resource_matches_filter("nwscript", "nss", ".dds"));
+    }
+
+    #[test]
+    fn resolves_diffuse_texture_from_enhanced_edition_material() {
+        let material = b"// material\nrenderhint NormalAndSpecMapped\ntexture0 mehrunes\ntexture1 mehrunes_n\n";
+        assert_eq!(mtr_diffuse_texture(material).as_deref(), Some("mehrunes"));
+        assert_eq!(mtr_diffuse_texture(b"texture0 null"), None);
+    }
+
+    #[test]
+    fn distant_virtualized_rows_include_inter_row_spacing() {
+        let offset = requested_virtualized_scroll_offset(10_000, 20.0, 4.0, 0.0, 400.0)
+            .expect("a distant row should request scrolling");
+        let expected = 10_000.0 * 24.0 - 190.0;
+        assert!((offset - expected).abs() < f32::EPSILON);
+        assert_eq!(
+            requested_virtualized_scroll_offset(10, 20.0, 4.0, 200.0, 400.0),
+            None
+        );
+    }
+
+    #[test]
     fn removes_uri_list_crlf_residue() {
         let paths = sanitize_clipboard_paths(vec![PathBuf::from("/tmp/example.mdl\r")]);
         assert_eq!(paths, vec![PathBuf::from("/tmp/example.mdl")]);
@@ -5122,6 +5546,44 @@ mod clipboard_tests {
                 panic!("NUL-padded ASCII MDL was classified as compiled")
             }
         }
+    }
+
+    #[test]
+    fn stages_recursive_supermodels_from_an_open_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let dependency_path = directory.path().join("pfg2.mdl");
+        fs::write(
+            &dependency_path,
+            b"newmodel pfg2\nsetsupermodel pfg2 a_fa2\nbeginmodelgeom pfg2\nendmodelgeom pfg2\ndonemodel pfg2\n",
+        )
+        .unwrap();
+        let root_path = directory.path().join("a_fa2.mdl");
+        fs::write(
+            &root_path,
+            b"newmodel a_fa2\nsetsupermodel a_fa2 NULL\nbeginmodelgeom a_fa2\nendmodelgeom a_fa2\ndonemodel a_fa2\n",
+        )
+        .unwrap();
+
+        let active = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        let mut dependencies = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        dependencies.add_file(&dependency_path).unwrap();
+        dependencies.add_file(&root_path).unwrap();
+        let tabs = vec![TabState::new(dependencies, false)];
+        let mut resolver = ModelDependencyResolver::new(&active, &tabs);
+        let workspace = tempfile::tempdir().unwrap();
+        let source = b"newmodel cloak\nsetsupermodel cloak pfg2\nbeginmodelgeom cloak\nendmodelgeom cloak\ndonemodel cloak\n";
+        let origins = stage_model_dependencies(
+            &mut resolver,
+            source,
+            workspace.path(),
+            &mut BTreeSet::new(),
+        )
+        .expect("the open archive should satisfy the complete supermodel chain");
+
+        assert_eq!(origins.len(), 2);
+        assert!(workspace.path().join("pfg2.mdl").is_file());
+        assert!(workspace.path().join("a_fa2.mdl").is_file());
+        assert!(origins.iter().all(|origin| origin.contains("open")));
     }
 
     #[cfg(target_os = "windows")]
