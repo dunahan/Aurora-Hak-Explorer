@@ -6,6 +6,7 @@ mod drag_out;
 #[cfg(target_os = "windows")]
 #[path = "drag_out_windows.rs"]
 mod drag_out;
+mod mdl;
 mod resource_types;
 
 use archive::{Archive, ArchiveKind, ArchiveVersion};
@@ -13,7 +14,10 @@ use eframe::egui::{self, Color32, RichText};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{OnceLock, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -23,8 +27,11 @@ const MAX_IMAGE_SIDE: u32 = 16_384;
 const MAX_TEXTURE_SIDE: u32 = 4096;
 const MAX_RECENT_ARCHIVES: usize = 8;
 const MAX_MODEL_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_MODEL_RENDER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_EXTRACTED_MODEL_STRINGS: usize = 2_000;
-const DISPLAY_VERSION: &str = "1.0.0";
+const DISPLAY_VERSION: &str = "1.1.0";
+type TextureDependencies = BTreeMap<String, Vec<archive::Entry>>;
+type TextureDependencyResult = (PathBuf, TextureDependencies);
 
 fn main() -> eframe::Result {
     let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
@@ -159,6 +166,12 @@ struct HakEditor {
     image_preview: Option<ImagePreviewCache>,
     model_preview: Option<ModelPreviewCache>,
     model_view: ModelView,
+    model_yaw: f32,
+    model_pitch: f32,
+    model_zoom: f32,
+    texture_dependency_directory: Option<PathBuf>,
+    texture_dependencies: TextureDependencies,
+    texture_dependency_receiver: Option<mpsc::Receiver<TextureDependencyResult>>,
 }
 
 struct ImagePreviewCache {
@@ -175,6 +188,13 @@ struct CachedImage {
 struct ModelPreviewCache {
     key: String,
     result: Result<ModelPreview, String>,
+    scene: Result<mdl::Scene, String>,
+    textures: BTreeMap<String, ModelTexture>,
+}
+
+struct ModelTexture {
+    handle: egui::TextureHandle,
+    flip_vertical: bool,
 }
 
 enum ModelPreview {
@@ -194,7 +214,15 @@ enum ModelPreview {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ModelView {
     Summary,
+    Model,
+    Source,
     Strings,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ModelExportAction {
+    Compile,
+    Decompile,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -398,7 +426,13 @@ impl HakEditor {
             resource_middle_scroll_active: false,
             image_preview: None,
             model_preview: None,
-            model_view: ModelView::Summary,
+            model_view: ModelView::Model,
+            model_yaw: -0.65,
+            model_pitch: 0.35,
+            model_zoom: 1.0,
+            texture_dependency_directory: None,
+            texture_dependencies: BTreeMap::new(),
+            texture_dependency_receiver: None,
         }
     }
 
@@ -481,7 +515,185 @@ impl HakEditor {
         }
     }
 
-    fn show_model_preview(&mut self, ui: &mut egui::Ui, entry: &archive::Entry) {
+    fn load_model_textures(
+        &mut self,
+        context: &egui::Context,
+        scene: &mdl::Scene,
+        cache_key: &str,
+    ) -> BTreeMap<String, ModelTexture> {
+        if self.archive.is_none() {
+            return BTreeMap::new();
+        }
+        self.ensure_texture_dependencies(context);
+        // Character-part models commonly name a generic engine texture such
+        // as M_Helmet while the matching PLT uses the model resref. This is
+        // NWN Explorer's "model name texture" behavior and is required when
+        // only the self-named PLT is present in the open archive.
+        let mut names = BTreeMap::from([(scene.name.to_ascii_lowercase(), None)]);
+        for mesh in &scene.meshes {
+            if let Some(name) = &mesh.texture_name {
+                let (name, requested_extension) = name.rsplit_once('.').map_or_else(
+                    || (name.as_str(), None),
+                    |(stem, extension)| (stem, Some(extension.to_ascii_lowercase())),
+                );
+                let name = name.to_ascii_lowercase();
+                if !name.is_empty() && name != "null" {
+                    names.insert(name, requested_extension);
+                }
+            }
+        }
+        let texture_rank = |extension: &str| match extension {
+            "plt" => 0,
+            "dds" => 1,
+            "tga" => 2,
+            "png" => 3,
+            "jpg" | "jpeg" => 4,
+            _ => usize::MAX,
+        };
+        let mut textures = BTreeMap::new();
+        for (name, requested_extension) in names {
+            let active = self.archive.iter().flat_map(|archive| &archive.entries);
+            let open_tabs = self.tabs.iter().flat_map(|tab| &tab.archive.entries);
+            let dependencies = self.texture_dependencies.get(&name).into_iter().flatten();
+            let Some(entry) = active
+                .chain(open_tabs)
+                .chain(dependencies)
+                .filter(|entry| entry.name.eq_ignore_ascii_case(&name))
+                .filter(|entry| texture_rank(&entry.extension()) != usize::MAX)
+                .min_by_key(|entry| {
+                    let extension = entry.extension();
+                    (
+                        requested_extension
+                            .as_deref()
+                            .is_none_or(|requested| requested != extension),
+                        texture_rank(&extension),
+                    )
+                })
+            else {
+                continue;
+            };
+            let size = match entry.size() {
+                Ok(size) if size <= MAX_IMAGE_FILE_SIZE => size,
+                _ => continue,
+            };
+            let extension = entry.extension();
+            let decoded = entry
+                .read_prefix(size)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| decode_preview_image(&bytes, &extension));
+            let Ok(decoded) = decoded else {
+                continue;
+            };
+            let decoded =
+                if decoded.width() > MAX_TEXTURE_SIDE || decoded.height() > MAX_TEXTURE_SIDE {
+                    decoded.thumbnail(MAX_TEXTURE_SIDE, MAX_TEXTURE_SIDE)
+                } else {
+                    decoded
+                };
+            let rgba = decoded.into_rgba8();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize],
+                rgba.as_raw(),
+            );
+            let texture = context.load_texture(
+                format!("{cache_key}:texture:{name}"),
+                color_image,
+                egui::TextureOptions::LINEAR_REPEAT,
+            );
+            textures.insert(
+                name,
+                ModelTexture {
+                    handle: texture,
+                    // NWN Explorer uploads PLT and DDS scanlines directly.
+                    // TGA and conventional web images are normalized to a
+                    // top-left origin by the image decoder and need flipping
+                    // to retain OpenGL-style model texture coordinates.
+                    flip_vertical: matches!(extension.as_str(), "tga" | "png" | "jpg" | "jpeg"),
+                },
+            );
+        }
+        textures
+    }
+
+    fn ensure_texture_dependencies(&mut self, context: &egui::Context) {
+        let directory = self
+            .archive
+            .as_ref()
+            .and_then(|archive| archive.path.as_ref())
+            .and_then(|path| path.parent())
+            .map(PathBuf::from);
+        if self.texture_dependency_directory == directory {
+            return;
+        }
+        self.texture_dependency_directory = directory.clone();
+        self.texture_dependencies.clear();
+        self.texture_dependency_receiver = None;
+        let Some(directory) = directory else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.texture_dependency_receiver = Some(receiver);
+        let repaint = context.clone();
+        thread::spawn(move || {
+            let mut dependencies = TextureDependencies::new();
+            if let Ok(files) = fs::read_dir(&directory) {
+                for path in files.filter_map(Result::ok).map(|entry| entry.path()) {
+                    if path.extension().is_none_or(|extension| {
+                        !extension.to_string_lossy().eq_ignore_ascii_case("hak")
+                    }) {
+                        continue;
+                    }
+                    let Ok(archive) = Archive::open(&path) else {
+                        continue;
+                    };
+                    for entry in archive.entries {
+                        let extension = entry.extension();
+                        if !matches!(
+                            extension.as_str(),
+                            "plt" | "dds" | "tga" | "png" | "jpg" | "jpeg"
+                        ) {
+                            continue;
+                        }
+                        let matches = dependencies
+                            .entry(entry.name.to_ascii_lowercase())
+                            .or_default();
+                        // Only the first resource of a given name and format can win the
+                        // existing texture preference order. Avoid retaining duplicates
+                        // from every sibling HAK.
+                        if !matches
+                            .iter()
+                            .any(|existing| existing.extension() == extension)
+                        {
+                            matches.push(entry);
+                        }
+                    }
+                }
+            }
+            let _ = sender.send((directory, dependencies));
+            repaint.request_repaint();
+        });
+    }
+
+    fn poll_texture_dependencies(&mut self) {
+        let result = self
+            .texture_dependency_receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some((directory, dependencies)) = result {
+            self.texture_dependency_receiver = None;
+            if self.texture_dependency_directory.as_ref() == Some(&directory) {
+                self.texture_dependencies = dependencies;
+                self.model_preview = None;
+            }
+        }
+    }
+
+    fn show_model_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        entry: &archive::Entry,
+    ) -> Option<ModelExportAction> {
+        let mut request_export = None;
         let size = entry.size().unwrap_or(0);
         let key = format!(
             "model-preview:{}:{}:{}:{}",
@@ -495,18 +707,47 @@ impl HakEditor {
             .as_ref()
             .is_none_or(|cache| cache.key != key)
         {
-            let result = entry
-                .read_prefix(size.min(MAX_MODEL_PREVIEW_BYTES))
-                .map_err(|error| format!("Could not read model: {error}"))
-                .and_then(|bytes| decode_model_preview(&bytes, size));
-            self.model_preview = Some(ModelPreviewCache { key, result });
-            self.model_view = ModelView::Summary;
+            let bytes = entry
+                .read_prefix(size.min(MAX_MODEL_RENDER_BYTES))
+                .map_err(|error| format!("Could not read model: {error}"));
+            let result = bytes.as_ref().map_err(Clone::clone).and_then(|bytes| {
+                decode_model_preview(
+                    &bytes[..bytes.len().min(MAX_MODEL_PREVIEW_BYTES as usize)],
+                    size,
+                )
+            });
+            let scene = if size > MAX_MODEL_RENDER_BYTES {
+                Err(format!(
+                    "Model rendering is limited to {} resources",
+                    human_size(MAX_MODEL_RENDER_BYTES)
+                ))
+            } else {
+                bytes
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|bytes| mdl::parse_scene(bytes))
+            };
+            let textures = scene
+                .as_ref()
+                .map(|scene| self.load_model_textures(ui.ctx(), scene, &key))
+                .unwrap_or_default();
+            self.model_preview = Some(ModelPreviewCache {
+                key,
+                result,
+                scene,
+                textures,
+            });
         }
 
-        match &self.model_preview.as_ref().unwrap().result {
+        let cache = self.model_preview.as_ref().unwrap();
+        match &cache.result {
             Ok(ModelPreview::Uncompiled { text, truncated }) => {
                 ui.label(RichText::new("Model Uncompiled").size(16.0).strong());
                 ui.label("ASCII model source");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.model_view, ModelView::Model, "View Model");
+                    ui.selectable_value(&mut self.model_view, ModelView::Source, "Source");
+                });
                 if *truncated {
                     ui.small(format!(
                         "Preview limited to the first {}",
@@ -514,9 +755,24 @@ impl HakEditor {
                     ));
                 }
                 ui.separator();
-                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
-                });
+                if self.model_view == ModelView::Model {
+                    if ui.button("Compile and Export…").clicked() {
+                        request_export = Some(ModelExportAction::Compile);
+                    }
+                    ui.add_space(4.0);
+                    show_model_scene(
+                        ui,
+                        &cache.scene,
+                        &cache.textures,
+                        &mut self.model_yaw,
+                        &mut self.model_pitch,
+                        &mut self.model_zoom,
+                    );
+                } else {
+                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
+                    });
+                }
             }
             Ok(ModelPreview::Compiled {
                 name,
@@ -528,6 +784,7 @@ impl HakEditor {
                 ui.label(RichText::new("Model Compiled").size(16.0).strong());
                 ui.label("Aurora binary model");
                 ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.model_view, ModelView::Model, "View Model");
                     ui.selectable_value(&mut self.model_view, ModelView::Summary, "Summary");
                     ui.selectable_value(
                         &mut self.model_view,
@@ -562,6 +819,20 @@ impl HakEditor {
                             ));
                         }
                     }
+                    ModelView::Model => {
+                        if ui.button("Decompile and Export…").clicked() {
+                            request_export = Some(ModelExportAction::Decompile);
+                        }
+                        ui.add_space(4.0);
+                        show_model_scene(
+                            ui,
+                            &cache.scene,
+                            &cache.textures,
+                            &mut self.model_yaw,
+                            &mut self.model_pitch,
+                            &mut self.model_zoom,
+                        );
+                    }
                     ModelView::Strings => {
                         ui.label(format!("{} readable strings", strings.len()));
                         if *truncated {
@@ -581,6 +852,9 @@ impl HakEditor {
                                 }
                             });
                     }
+                    ModelView::Source => {
+                        self.model_view = ModelView::Model;
+                    }
                 }
             }
             Err(error) => {
@@ -588,6 +862,7 @@ impl HakEditor {
                 ui.colored_label(Color32::LIGHT_RED, error);
             }
         }
+        request_export
     }
 
     fn fail(&mut self, context: &str, error: impl std::fmt::Display) {
@@ -1065,6 +1340,217 @@ impl HakEditor {
             self.status = format!("Exported {count} resources to {}", dir.display());
         }
     }
+
+    fn export_selected_models(&mut self, action: ModelExportAction) {
+        match action {
+            ModelExportAction::Compile => self.compile_selected_models(),
+            ModelExportAction::Decompile => self.decompile_selected_models(),
+        }
+    }
+
+    fn compile_selected_models(&mut self) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        let model_indices: Vec<usize> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|index| {
+                archive.entries.get(*index).is_some_and(|entry| {
+                    entry.extension() == "mdl"
+                        && model_export_action(entry) == Ok(ModelExportAction::Compile)
+                })
+            })
+            .collect();
+        if model_indices.is_empty() {
+            return;
+        }
+        let destination = if model_indices.len() == 1 {
+            let entry = &archive.entries[model_indices[0]];
+            rfd::FileDialog::new()
+                .add_filter("Aurora compiled model", &["mdl"])
+                .set_file_name(entry.filename())
+                .save_file()
+                .map(|path| (Some(path), None))
+        } else {
+            rfd::FileDialog::new()
+                .pick_folder()
+                .map(|path| (None, Some(path)))
+        };
+        let Some((single_path, directory)) = destination else {
+            return;
+        };
+
+        let compiler = match model_compiler() {
+            Ok(compiler) => compiler,
+            Err(error) => {
+                self.fail("Could not compile model", error);
+                return;
+            }
+        };
+        let sources: Result<Vec<(String, Vec<u8>)>, String> = model_indices
+            .iter()
+            .map(|index| {
+                let entry = &archive.entries[*index];
+                let filename = entry.safe_filename().map_err(|error| error.to_string())?;
+                let size = entry.size().map_err(|error| error.to_string())?;
+                if size > MAX_MODEL_RENDER_BYTES {
+                    return Err(format!(
+                        "{} exceeds the {} compilation limit",
+                        entry.filename(),
+                        human_size(MAX_MODEL_RENDER_BYTES)
+                    ));
+                }
+                let bytes = entry.read_prefix(size).map_err(|error| error.to_string())?;
+                Ok((filename, bytes))
+            })
+            .collect();
+        let sources = match sources {
+            Ok(sources) => sources,
+            Err(error) => {
+                self.fail("Could not compile model", error);
+                return;
+            }
+        };
+        let workspace = match tempfile::Builder::new()
+            .prefix("ahe-model-compile-")
+            .tempdir()
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.fail("Could not prepare model compiler", error);
+                return;
+            }
+        };
+
+        let mut exported = 0usize;
+        let mut failure = None;
+        for (ordinal, (filename, source)) in sources.iter().enumerate() {
+            let model_workspace = workspace.path().join(format!("model-{ordinal}"));
+            let result = (|| -> Result<PathBuf, String> {
+                fs::create_dir(&model_workspace).map_err(|error| error.to_string())?;
+                // Make the other selected ASCII models available as local
+                // supermodel dependencies while compiling this model.
+                for (dependency_name, dependency_source) in &sources {
+                    fs::write(model_workspace.join(dependency_name), dependency_source)
+                        .map_err(|error| error.to_string())?;
+                }
+                let mut staged_dependencies = BTreeSet::new();
+                staged_dependencies.insert(
+                    filename
+                        .strip_suffix(".mdl")
+                        .unwrap_or(filename)
+                        .to_ascii_lowercase(),
+                );
+                stage_model_dependencies(
+                    archive,
+                    source,
+                    &model_workspace,
+                    &mut staged_dependencies,
+                )?;
+                let input = model_workspace.join(format!("{filename}.ascii"));
+                fs::write(&input, source).map_err(|error| error.to_string())?;
+                let compiled = run_model_compiler(&compiler.path, &model_workspace, &input)?;
+                let destination = single_path
+                    .clone()
+                    .unwrap_or_else(|| directory.as_ref().unwrap().join(filename));
+                fs::copy(&compiled, &destination).map_err(|error| error.to_string())?;
+                Ok(destination)
+            })();
+            match result {
+                Ok(_) => exported += 1,
+                Err(error) => {
+                    failure = Some(format!("{filename}: {error}"));
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            self.fail("Could not compile model", error);
+        } else if let Some(path) = single_path {
+            self.status = format!("Compiled model to {}", path.display());
+        } else if let Some(directory) = directory {
+            self.status = format!("Compiled {exported} models to {}", directory.display());
+        }
+    }
+
+    fn decompile_selected_models(&mut self) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        let model_indices: Vec<usize> = self
+            .selected
+            .iter()
+            .copied()
+            .filter(|index| {
+                archive.entries.get(*index).is_some_and(|entry| {
+                    entry.extension() == "mdl"
+                        && model_export_action(entry) == Ok(ModelExportAction::Decompile)
+                })
+            })
+            .collect();
+        if model_indices.is_empty() {
+            return;
+        }
+        let destination = if model_indices.len() == 1 {
+            let entry = &archive.entries[model_indices[0]];
+            rfd::FileDialog::new()
+                .add_filter("Aurora ASCII model", &["mdl"])
+                .set_file_name(entry.filename())
+                .save_file()
+                .map(|path| (Some(path), None))
+        } else {
+            rfd::FileDialog::new()
+                .pick_folder()
+                .map(|path| (None, Some(path)))
+        };
+        let Some((single_path, directory)) = destination else {
+            return;
+        };
+        let mut exported = 0usize;
+        let mut failure = None;
+        for index in model_indices {
+            let entry = &archive.entries[index];
+            let result = entry
+                .size()
+                .map_err(|error| error.to_string())
+                .and_then(|size| {
+                    if size > MAX_MODEL_RENDER_BYTES {
+                        Err(format!(
+                            "{} exceeds the {} decompilation limit",
+                            entry.filename(),
+                            human_size(MAX_MODEL_RENDER_BYTES)
+                        ))
+                    } else {
+                        entry.read_prefix(size).map_err(|error| error.to_string())
+                    }
+                })
+                .and_then(|bytes| mdl::decompile(&bytes))
+                .and_then(|text| {
+                    let path = single_path
+                        .clone()
+                        .unwrap_or_else(|| directory.as_ref().unwrap().join(entry.filename()));
+                    fs::write(&path, text)
+                        .map(|()| path)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(_) => exported += 1,
+                Err(error) => {
+                    failure = Some(format!("{}: {error}", entry.filename()));
+                    break;
+                }
+            }
+        }
+        if let Some(error) = failure {
+            self.fail("Could not decompile model", error);
+        } else if let Some(path) = single_path {
+            self.status = format!("Decompiled model to {}", path.display());
+        } else if let Some(directory) = directory {
+            self.status = format!("Decompiled {exported} models to {}", directory.display());
+        }
+    }
     fn drag_selected(&mut self, frame: &eframe::Frame) {
         let Some(archive) = self.archive.as_ref() else {
             return;
@@ -1322,6 +1808,7 @@ impl eframe::App for HakEditor {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_texture_dependencies();
         self.hovered_drop_files = ctx.input(|input| {
             input
                 .raw
@@ -1774,6 +2261,9 @@ impl eframe::App for HakEditor {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::A)) {
                 request_select_all = true;
             }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E)) {
+                self.export_selected();
+            }
         }
         let pending_clipboard_command = if global_shortcuts_enabled {
             self.pending_clipboard_command.take()
@@ -1865,6 +2355,8 @@ impl eframe::App for HakEditor {
             });
         });
         let mut categories = BTreeMap::<String, usize>::new();
+        let mut compiled_models = 0;
+        let mut uncompiled_models = 0;
         let new_count = self
             .archive
             .as_ref()
@@ -1881,6 +2373,11 @@ impl eframe::App for HakEditor {
                 *categories
                     .entry(category_for(&entry.extension()).to_owned())
                     .or_default() += 1;
+                match entry.model_compiled() {
+                    Some(true) => compiled_models += 1,
+                    Some(false) => uncompiled_models += 1,
+                    None => {}
+                }
             }
             let bytes = a
                 .entries
@@ -1932,6 +2429,24 @@ impl eframe::App for HakEditor {
                             self.selection_cursor = None;
                         }
                         for (category, amount) in &categories {
+                            if category == "Models" {
+                                for (label, count) in [
+                                    ("Models All", *amount),
+                                    ("Models Compiled", compiled_models),
+                                    ("Models Uncompiled", uncompiled_models),
+                                ] {
+                                    let active = self.category.as_deref() == Some(label)
+                                        || (label == "Models All"
+                                            && self.category.as_deref() == Some("Models"));
+                                    if resource_tree_row(ui, active, label, count).clicked() {
+                                        self.category = Some(label.to_owned());
+                                        self.selected.clear();
+                                        self.selection_anchor = None;
+                                        self.selection_cursor = None;
+                                    }
+                                }
+                                continue;
+                            }
                             let active = self.category.as_deref() == Some(category);
                             if resource_tree_row(ui, active, category, *amount).clicked() {
                                 self.category = Some(category.clone());
@@ -1994,7 +2509,9 @@ impl eframe::App for HakEditor {
                             if is_previewable_image(&extension) {
                                 self.show_image_preview(ui, entry);
                             } else if extension == "mdl" {
-                                self.show_model_preview(ui, entry);
+                                if let Some(action) = self.show_model_preview(ui, entry) {
+                                    self.export_selected_models(action);
+                                }
                             } else {
                                 match entry.read_prefix(256 * 1024) {
                                     Ok(bytes) if extension == "2da" => show_2da_preview(ui, &bytes),
@@ -2228,6 +2745,7 @@ impl eframe::App for HakEditor {
                 ui.separator();
                 let mut request_delete = false;
                 let mut request_export = false;
+                let mut request_model_export = None;
                 let mut request_drag = None;
                 let resource_scroll = egui::ScrollArea::vertical()
                     .id_salt("resource_entries")
@@ -2369,6 +2887,33 @@ impl eframe::App for HakEditor {
                                             request_export = true;
                                             ui.close();
                                         }
+                                        let model_export_action =
+                                            selected_model_export_action(a, &self.selected);
+                                        let model_export_label = match model_export_action {
+                                            Some(ModelExportAction::Compile) if count == 1 => {
+                                                "Compile and export model…"
+                                            }
+                                            Some(ModelExportAction::Compile) => {
+                                                "Compile and export selected models…"
+                                            }
+                                            Some(ModelExportAction::Decompile) if count == 1 => {
+                                                "Decompile and export model…"
+                                            }
+                                            Some(ModelExportAction::Decompile) => {
+                                                "Decompile and export selected models…"
+                                            }
+                                            None => "Compile/decompile selected models…",
+                                        };
+                                        if ui
+                                            .add_enabled(
+                                                model_export_action.is_some(),
+                                                egui::Button::new(model_export_label),
+                                            )
+                                            .clicked()
+                                        {
+                                            request_model_export = model_export_action;
+                                            ui.close();
+                                        }
                                         if ui.button(format!("Delete selected ({count})")).clicked()
                                         {
                                             request_delete = true;
@@ -2412,6 +2957,8 @@ impl eframe::App for HakEditor {
                 }
                 if request_drag.is_some() {
                     self.drag_selected(frame);
+                } else if let Some(action) = request_model_export {
+                    self.export_selected_models(action);
                 } else if request_export {
                     self.export_selected();
                 } else if request_delete {
@@ -2877,6 +3424,238 @@ impl eframe::App for HakEditor {
     }
 }
 
+fn selected_model_export_action(
+    archive: &Archive,
+    selected: &BTreeSet<usize>,
+) -> Option<ModelExportAction> {
+    let mut action = None;
+    for index in selected {
+        let entry = archive.entries.get(*index)?;
+        if entry.extension() != "mdl" {
+            return None;
+        }
+        let entry_action = model_export_action(entry).ok()?;
+        if action.is_some_and(|current| current != entry_action) {
+            return None;
+        }
+        action = Some(entry_action);
+    }
+    action
+}
+
+fn model_export_action(entry: &archive::Entry) -> Result<ModelExportAction, String> {
+    let prefix = entry.read_prefix(4).map_err(|error| error.to_string())?;
+    if prefix.len() < 4 {
+        return Err("model is too small to identify".into());
+    }
+    if prefix == [0, 0, 0, 0] {
+        Ok(ModelExportAction::Decompile)
+    } else {
+        Ok(ModelExportAction::Compile)
+    }
+}
+
+fn stage_model_dependencies(
+    archive: &Archive,
+    source: &[u8],
+    workspace: &Path,
+    visited: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let text = String::from_utf8_lossy(source);
+    let supermodel = text.lines().find_map(|line| {
+        let mut tokens = line.split_whitespace();
+        let directive = tokens.next()?;
+        if !directive.eq_ignore_ascii_case("setsupermodel") {
+            return None;
+        }
+        let _model_name = tokens.next()?;
+        tokens.next().map(str::to_string)
+    });
+    let Some(supermodel) = supermodel else {
+        return Ok(());
+    };
+    if supermodel.eq_ignore_ascii_case("null") || supermodel.is_empty() {
+        return Ok(());
+    }
+    let key = supermodel.to_ascii_lowercase();
+    if !visited.insert(key) {
+        return Ok(());
+    }
+    let entry = archive
+        .entries
+        .iter()
+        .find(|entry| entry.extension() == "mdl" && entry.name.eq_ignore_ascii_case(&supermodel))
+        .ok_or_else(|| format!("required supermodel \"{supermodel}\" is not in this archive"))?;
+    let size = entry.size().map_err(|error| error.to_string())?;
+    if size > MAX_MODEL_RENDER_BYTES {
+        return Err(format!(
+            "supermodel {} exceeds the {} compilation limit",
+            entry.filename(),
+            human_size(MAX_MODEL_RENDER_BYTES)
+        ));
+    }
+    let bytes = entry.read_prefix(size).map_err(|error| error.to_string())?;
+    let filename = entry.safe_filename().map_err(|error| error.to_string())?;
+    fs::write(workspace.join(filename), &bytes).map_err(|error| error.to_string())?;
+    if model_export_action(entry) == Ok(ModelExportAction::Compile) {
+        stage_model_dependencies(archive, &bytes, workspace, visited)?;
+    }
+    Ok(())
+}
+
+struct ModelCompiler {
+    path: PathBuf,
+    // Retains an extracted embedded helper for exactly as long as the compile
+    // operation needs it. Linux packages use a permanent AppImage helper.
+    _temporary_directory: Option<tempfile::TempDir>,
+}
+
+fn model_compiler() -> Result<ModelCompiler, String> {
+    if let Some(path) = std::env::var_os("AHE_MODEL_COMPILER").map(PathBuf::from) {
+        if path.is_file() {
+            return Ok(ModelCompiler {
+                path,
+                _temporary_directory: None,
+            });
+        }
+        return Err(format!(
+            "AHE_MODEL_COMPILER points to a missing file: {}",
+            path.display()
+        ));
+    }
+    bundled_model_compiler()
+}
+
+#[cfg(target_os = "windows")]
+fn bundled_model_compiler() -> Result<ModelCompiler, String> {
+    const COMPILER: &[u8] = include_bytes!("../tools/windows/nwnmdlcomp.exe");
+    let directory = tempfile::Builder::new()
+        .prefix("ahe-model-compiler-")
+        .tempdir()
+        .map_err(|error| format!("could not prepare the embedded model compiler: {error}"))?;
+    let path = directory.path().join("nwnmdlcomp.exe");
+    fs::write(&path, COMPILER)
+        .map_err(|error| format!("could not extract the embedded model compiler: {error}"))?;
+    Ok(ModelCompiler {
+        path,
+        _temporary_directory: Some(directory),
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn bundled_model_compiler() -> Result<ModelCompiler, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("could not locate the AHE executable: {error}"))?;
+    let executable_directory = executable
+        .parent()
+        .ok_or_else(|| "could not locate the AHE executable directory".to_string())?;
+    let helper_name = "nwnmdlcomp";
+    let candidates = [
+        executable_directory.join(helper_name),
+        executable_directory
+            .parent()
+            .unwrap_or(executable_directory)
+            .join("libexec")
+            .join("aurora-hak-explorer")
+            .join(helper_name),
+        Path::new("tools")
+            .join(std::env::consts::OS)
+            .join(helper_name),
+    ];
+    let path = candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "the bundled NWN model compiler could not be found; reinstall Aurora Hak Explorer"
+                .to_string()
+        })?;
+    Ok(ModelCompiler {
+        path,
+        _temporary_directory: None,
+    })
+}
+
+fn run_model_compiler(compiler: &Path, workspace: &Path, input: &Path) -> Result<PathBuf, String> {
+    let output_path = input.with_extension("");
+    let source_scene = fs::read(input)
+        .ok()
+        .and_then(|source| mdl::parse_scene(&source).ok());
+    #[cfg(target_os = "windows")]
+    let output = Command::new(compiler)
+        .arg("-cqe")
+        .arg(input)
+        .arg(&output_path)
+        .current_dir(workspace)
+        .output();
+    #[cfg(not(target_os = "windows"))]
+    let output = Command::new(compiler)
+        .arg("-cq")
+        // The patched standalone helper accepts an empty resource directory.
+        // It never starts NWN; this argument only preserves its historical CLI.
+        .arg(workspace)
+        .arg(input)
+        .current_dir(workspace)
+        .output();
+    let output = output.map_err(|error| format!("could not start model compiler: {error}"))?;
+    let compiled = fs::read(&output_path).map_err(|error| {
+        let diagnostics = compiler_diagnostics(&output.stdout, &output.stderr);
+        if diagnostics.is_empty() {
+            format!("compiler did not create an output model: {error}")
+        } else {
+            format!("compiler did not create a valid output model: {diagnostics}")
+        }
+    })?;
+    if !valid_compiled_model(&compiled) {
+        let diagnostics = compiler_diagnostics(&output.stdout, &output.stderr);
+        return Err(if diagnostics.is_empty() {
+            "compiler output was not a valid binary MDL".into()
+        } else {
+            format!("compiler output was not a valid binary MDL: {diagnostics}")
+        });
+    }
+    if source_scene
+        .as_ref()
+        .is_some_and(|scene| scene.face_count > 0)
+        && mdl::parse_scene(&compiled).map_or(true, |scene| scene.face_count == 0)
+    {
+        return Err("compiler dropped the model's renderable mesh geometry".into());
+    }
+    if !output.status.success() {
+        return Err(compiler_diagnostics(&output.stdout, &output.stderr));
+    }
+    Ok(output_path)
+}
+
+fn compiler_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut diagnostics = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        if !diagnostics.is_empty() {
+            diagnostics.push('\n');
+        }
+        diagnostics.push_str(stderr);
+    }
+    const MAX_DIAGNOSTICS: usize = 4_000;
+    if diagnostics.len() > MAX_DIAGNOSTICS {
+        diagnostics.truncate(MAX_DIAGNOSTICS);
+        diagnostics.push('…');
+    }
+    diagnostics
+}
+
+fn valid_compiled_model(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || bytes[..4] != [0, 0, 0, 0] {
+        return false;
+    }
+    let structured_size = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let raw_size = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    12usize
+        .checked_add(structured_size)
+        .and_then(|size| size.checked_add(raw_size))
+        .is_some_and(|size| size <= bytes.len())
+}
+
 fn add_incoming(archive: &mut Archive, batch: &mut AddBatch, path: PathBuf) {
     match archive.add_file(&path) {
         Ok(true) => batch.replaced += 1,
@@ -3036,6 +3815,9 @@ fn entry_matches_category(entry: &archive::Entry, category: Option<&str>) -> boo
     match category {
         None => true,
         Some("New") => entry.is_new(),
+        Some("Models" | "Models All") => category_for(&entry.extension()) == "Models",
+        Some("Models Compiled") => entry.model_compiled() == Some(true),
+        Some("Models Uncompiled") => entry.model_compiled() == Some(false),
         Some(wanted) => category_for(&entry.extension()) == wanted,
     }
 }
@@ -3061,6 +3843,245 @@ fn is_text_type(extension: &str) -> bool {
             | "tml"
             | "sql"
     )
+}
+
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+fn show_model_scene(
+    ui: &mut egui::Ui,
+    scene: &Result<mdl::Scene, String>,
+    textures: &BTreeMap<String, ModelTexture>,
+    yaw: &mut f32,
+    pitch: &mut f32,
+    zoom: &mut f32,
+) {
+    let scene = match scene {
+        Ok(scene) => scene,
+        Err(error) => {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.colored_label(Color32::LIGHT_RED, error);
+            });
+            return;
+        }
+    };
+    let desired = egui::vec2(
+        ui.available_width().max(160.0),
+        ui.available_height().max(300.0),
+    );
+    let (response, painter) = ui.allocate_painter(desired, egui::Sense::drag());
+    let rect = response.rect.shrink(8.0);
+    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+    if response.dragged() {
+        let delta = ui.ctx().input(|input| input.pointer.delta());
+        *yaw += delta.x * 0.012;
+        *pitch = (*pitch + delta.y * 0.012).clamp(-1.5, 1.5);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+    if response.hovered() {
+        let scroll = ui.ctx().input(|input| input.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            *zoom = (*zoom * (scroll * 0.0025).exp()).clamp(0.15, 8.0);
+        }
+    }
+    if response.double_clicked() {
+        *yaw = -0.65;
+        *pitch = 0.35;
+        *zoom = 1.0;
+    }
+
+    let center = [
+        (scene.bounds_min[0] + scene.bounds_max[0]) * 0.5,
+        (scene.bounds_min[1] + scene.bounds_max[1]) * 0.5,
+        (scene.bounds_min[2] + scene.bounds_max[2]) * 0.5,
+    ];
+    let extent = (0..3)
+        .map(|axis| scene.bounds_max[axis] - scene.bounds_min[axis])
+        .fold(0.0_f32, f32::max)
+        .max(1.0e-4);
+    let scale = rect.width().min(rect.height()) * 0.72 / extent * *zoom;
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let rotate = |point: [f32; 3]| {
+        let point = [
+            point[0] - center[0],
+            point[1] - center[1],
+            point[2] - center[2],
+        ];
+        let x = cos_yaw * point[0] - sin_yaw * point[1];
+        let y = sin_yaw * point[0] + cos_yaw * point[1];
+        [
+            x,
+            cos_pitch * point[2] - sin_pitch * y,
+            sin_pitch * point[2] + cos_pitch * y,
+        ]
+    };
+    struct DrawFace {
+        points: [egui::Pos2; 3],
+        depth: f32,
+        color: Color32,
+        vertex_colors: [Color32; 3],
+        texture: Option<(egui::TextureId, [egui::Pos2; 3])>,
+    }
+    let mut draw_faces = Vec::with_capacity(scene.face_count.min(300_000));
+    let light = [0.35_f32, -0.45, 0.82];
+    for mesh in &scene.meshes {
+        let rotated: Vec<[f32; 3]> = mesh.vertices.iter().copied().map(rotate).collect();
+        let rotated_normals: Vec<[f32; 3]> = mesh
+            .normals
+            .iter()
+            .map(|normal| {
+                let x = cos_yaw * normal[0] - sin_yaw * normal[1];
+                let y = sin_yaw * normal[0] + cos_yaw * normal[1];
+                [
+                    x,
+                    cos_pitch * normal[2] - sin_pitch * y,
+                    sin_pitch * normal[2] + cos_pitch * y,
+                ]
+            })
+            .collect();
+        let texture = mesh
+            .texture_name
+            .as_deref()
+            .and_then(|name| {
+                name.rsplit_once('.')
+                    .map_or(Some(name), |(stem, _)| Some(stem))
+            })
+            .and_then(|name| textures.get(&name.to_ascii_lowercase()));
+        let texture = texture.or_else(|| textures.get(&scene.name.to_ascii_lowercase()));
+        for (face_index, face) in mesh.faces.iter().enumerate() {
+            if draw_faces.len() >= 300_000 {
+                break;
+            }
+            let Some(&a) = rotated.get(face[0] as usize) else {
+                continue;
+            };
+            let Some(&b) = rotated.get(face[1] as usize) else {
+                continue;
+            };
+            let Some(&c) = rotated.get(face[2] as usize) else {
+                continue;
+            };
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let normal = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            let length =
+                (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+            let edge_squared = dot3(ab, ab).max(dot3(ac, ac)).max(dot3(
+                [c[0] - b[0], c[1] - b[1], c[2] - b[2]],
+                [c[0] - b[0], c[1] - b[1], c[2] - b[2]],
+            ));
+            // Bad or helper geometry occasionally contains almost zero-area
+            // triangles with extremely long edges. Their outlines appear as
+            // rays across the preview, so discard only these degenerates.
+            if !length.is_finite()
+                || length < 1.0e-8
+                || edge_squared > 0.0 && length / edge_squared < 1.0e-5
+            {
+                continue;
+            }
+            let illumination =
+                ((normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]) / length)
+                    .abs()
+                    .mul_add(0.68, 0.24)
+                    .clamp(0.12, 1.0);
+            let color = Color32::from_rgb(
+                (mesh.color[0] * illumination * 255.0) as u8,
+                (mesh.color[1] * illumination * 255.0) as u8,
+                (mesh.color[2] * illumination * 255.0) as u8,
+            );
+            let vertex_colors = face.map(|index| {
+                let vertex_illumination = rotated_normals
+                    .get(index as usize)
+                    .map(|normal| {
+                        dot3(*normal, light)
+                            .abs()
+                            .mul_add(0.68, 0.24)
+                            .clamp(0.12, 1.0)
+                    })
+                    .unwrap_or(illumination);
+                Color32::from_gray((vertex_illumination * 255.0) as u8)
+            });
+            let project = |point: [f32; 3]| {
+                egui::pos2(
+                    rect.center().x + point[0] * scale,
+                    rect.center().y - point[1] * scale,
+                )
+            };
+            let texture = texture.and_then(|texture| {
+                let indices = mesh.texture_faces.get(face_index)?;
+                let uv = indices.map(|index| {
+                    let value = mesh.texture_vertices.get(index as usize).copied()?;
+                    let vertical = if texture.flip_vertical {
+                        1.0 - value[1]
+                    } else {
+                        value[1]
+                    };
+                    Some(egui::pos2(value[0], vertical))
+                });
+                Some((texture.handle.id(), [uv[0]?, uv[1]?, uv[2]?]))
+            });
+            draw_faces.push(DrawFace {
+                points: [project(a), project(b), project(c)],
+                depth: (a[2] + b[2] + c[2]) / 3.0,
+                color: if texture.is_some() {
+                    Color32::from_gray((illumination * 255.0) as u8)
+                } else {
+                    color
+                },
+                vertex_colors,
+                texture,
+            });
+        }
+    }
+    draw_faces.sort_by(|left, right| left.depth.total_cmp(&right.depth));
+    for face in draw_faces {
+        if let Some((texture, uv)) = face.texture {
+            let mut mesh = egui::Mesh::with_texture(texture);
+            for ((pos, uv), color) in face.points.into_iter().zip(uv).zip(face.vertex_colors) {
+                mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
+            }
+            mesh.indices.extend_from_slice(&[0, 1, 2]);
+            painter.add(egui::Shape::mesh(mesh));
+        } else {
+            painter.add(egui::Shape::convex_polygon(
+                face.points.to_vec(),
+                face.color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        format!(
+            "{} — {} vertices, {} faces",
+            scene.name, scene.vertex_count, scene.face_count
+        ),
+        egui::FontId::proportional(12.0),
+        ui.visuals().weak_text_color(),
+    );
+    painter.text(
+        rect.left_bottom() + egui::vec2(8.0, -8.0),
+        egui::Align2::LEFT_BOTTOM,
+        "Drag to rotate • Wheel to zoom • Double-click to reset",
+        egui::FontId::proportional(11.0),
+        ui.visuals().weak_text_color(),
+    );
 }
 
 fn decode_model_preview(bytes: &[u8], total_size: u64) -> Result<ModelPreview, String> {
@@ -3644,18 +4665,6 @@ fn decode_bc4_block(block: &[u8]) -> [u8; 16] {
 
 fn decode_plt_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     const HEADER_SIZE: usize = 24;
-    const LAYER_COLORS: [[u8; 4]; 10] = [
-        [224, 191, 160, 255], // skin
-        [74, 52, 26, 255],    // hair
-        [176, 184, 192, 255], // metal 1
-        [226, 168, 60, 255],  // metal 2
-        [171, 47, 39, 255],   // cloth 1
-        [42, 86, 173, 255],   // cloth 2
-        [92, 62, 41, 255],    // leather 1
-        [128, 92, 58, 255],   // leather 2
-        [37, 152, 117, 255],  // tattoo 1
-        [108, 64, 160, 255],  // tattoo 2
-    ];
 
     if bytes.len() < HEADER_SIZE {
         return Err("PLT header is truncated".into());
@@ -3680,21 +4689,63 @@ fn decode_plt_preview(bytes: &[u8]) -> Result<image::DynamicImage, String> {
         return Err("PLT pixel data is truncated".into());
     }
 
+    let palettes = default_plt_palettes()?;
     let mut rgba = Vec::with_capacity(pixel_count * 4);
     for pixel in bytes[HEADER_SIZE..HEADER_SIZE + payload_size].chunks_exact(2) {
-        let value = u16::from(pixel[0]);
-        let base = LAYER_COLORS
+        let color = palettes
             .get(pixel[1] as usize)
+            .and_then(|palette| palette.get(pixel[0] as usize))
             .copied()
             .unwrap_or([255, 0, 255, 255]);
-        for channel in base {
-            rgba.push(((u16::from(channel) * value + 127) / 255) as u8);
-        }
+        // NWN Explorer's fixed-function model renderer does not blend these
+        // palette alpha values for ordinary meshes. Keep the preview opaque
+        // to avoid exposing back-facing triangles through solid equipment.
+        rgba.extend_from_slice(&[color[0], color[1], color[2], 255]);
     }
 
     let buffer = image::RgbaImage::from_raw(width, height, rgba)
         .ok_or_else(|| "Could not construct PLT preview image".to_owned())?;
     Ok(image::DynamicImage::ImageRgba8(buffer))
+}
+
+fn default_plt_palettes() -> Result<&'static [[[u8; 4]; 256]; 10], String> {
+    static PALETTES: OnceLock<Result<[[[u8; 4]; 256]; 10], String>> = OnceLock::new();
+    PALETTES
+        .get_or_init(|| {
+            const SOURCES: [&[u8]; 10] = [
+                include_bytes!("../assets/pal_skin01.tga"),
+                include_bytes!("../assets/pal_hair01.tga"),
+                include_bytes!("../assets/pal_armor01.tga"),
+                include_bytes!("../assets/pal_armor02.tga"),
+                include_bytes!("../assets/pal_cloth01.tga"),
+                include_bytes!("../assets/pal_cloth01.tga"),
+                include_bytes!("../assets/pal_leath01.tga"),
+                include_bytes!("../assets/pal_leath01.tga"),
+                include_bytes!("../assets/pal_tattoo01.tga"),
+                include_bytes!("../assets/pal_tattoo01.tga"),
+            ];
+            let mut palettes = [[[0_u8; 4]; 256]; 10];
+            for (layer, source) in SOURCES.iter().enumerate() {
+                let image = image::load_from_memory_with_format(source, image::ImageFormat::Tga)
+                    .map_err(|error| format!("Could not decode PLT palette {layer}: {error}"))?
+                    .into_rgba8();
+                if image.width() != 256 || image.height() != 256 {
+                    return Err(format!(
+                        "PLT palette {layer} has unexpected dimensions {} x {}",
+                        image.width(),
+                        image.height()
+                    ));
+                }
+                // NWN Explorer defaults each material selection to palette
+                // zero, represented by the visually top row of these TGAs.
+                for index in 0..256 {
+                    palettes[layer][index as usize] = image.get_pixel(index, 0).0;
+                }
+            }
+            Ok(palettes)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 fn nwn_dds_to_standard(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -3839,6 +4890,55 @@ mod clipboard_tests {
     }
 
     #[test]
+    fn separates_compiled_and_uncompiled_model_categories() {
+        let directory = tempfile::tempdir().unwrap();
+        let compiled_path = directory.path().join("compiled.mdl");
+        let uncompiled_path = directory.path().join("uncompiled.mdl");
+        let material_path = directory.path().join("surface.mtr");
+        fs::write(&compiled_path, [0_u8; 12]).unwrap();
+        fs::write(
+            &uncompiled_path,
+            b"newmodel example\nbeginmodelgeom example\n",
+        )
+        .unwrap();
+        fs::write(&material_path, b"renderhint NormalAndSpecMapped\n").unwrap();
+
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        archive.add_file(compiled_path).unwrap();
+        archive.add_file(uncompiled_path).unwrap();
+        archive.add_file(material_path).unwrap();
+
+        let compiled = archive
+            .entries
+            .iter()
+            .find(|entry| entry.name == "compiled")
+            .unwrap();
+        let uncompiled = archive
+            .entries
+            .iter()
+            .find(|entry| entry.name == "uncompiled")
+            .unwrap();
+        let material = archive
+            .entries
+            .iter()
+            .find(|entry| entry.name == "surface")
+            .unwrap();
+
+        assert!(entry_matches_category(compiled, Some("Models All")));
+        assert!(entry_matches_category(compiled, Some("Models Compiled")));
+        assert!(!entry_matches_category(compiled, Some("Models Uncompiled")));
+        assert!(entry_matches_category(uncompiled, Some("Models All")));
+        assert!(entry_matches_category(
+            uncompiled,
+            Some("Models Uncompiled")
+        ));
+        assert!(!entry_matches_category(uncompiled, Some("Models Compiled")));
+        assert!(entry_matches_category(material, Some("Models All")));
+        assert!(!entry_matches_category(material, Some("Models Compiled")));
+        assert!(!entry_matches_category(material, Some("Models Uncompiled")));
+    }
+
+    #[test]
     fn decodes_a_preview_image() {
         let decoded = decode_preview_image(include_bytes!("../assets/aheicon-256.png"), "png")
             .expect("the bundled PNG should decode through the preview path");
@@ -3890,8 +4990,22 @@ mod clipboard_tests {
         let decoded = decode_preview_image(&plt, "plt").expect("PLT should decode");
         assert_eq!((decoded.width(), decoded.height()), (2, 1));
         let pixels = decoded.into_rgba8();
-        assert_eq!(pixels.get_pixel(0, 0).0, [171, 47, 39, 255]);
-        assert_eq!(pixels.get_pixel(1, 0).0, [21, 43, 87, 128]);
+        let palettes = default_plt_palettes().expect("bundled palettes should decode");
+        let expected_cloth = palettes[4][255];
+        let expected_second_cloth = palettes[5][128];
+        assert_eq!(
+            pixels.get_pixel(0, 0).0,
+            [expected_cloth[0], expected_cloth[1], expected_cloth[2], 255]
+        );
+        assert_eq!(
+            pixels.get_pixel(1, 0).0,
+            [
+                expected_second_cloth[0],
+                expected_second_cloth[1],
+                expected_second_cloth[2],
+                255
+            ]
+        );
     }
 
     #[test]
@@ -4008,5 +5122,29 @@ mod clipboard_tests {
                 panic!("NUL-padded ASCII MDL was classified as compiled")
             }
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn embedded_windows_compiler_creates_a_binary_model() {
+        let workspace = tempfile::tempdir().unwrap();
+        let input = workspace.path().join("test.mdl.ascii");
+        let source = b"newmodel test\nsetsupermodel test NULL\nbeginmodelgeom test\nnode trimesh mesh\n parent NULL\n verts 3\n 0 0 0\n 1 0 0\n 0 1 0\n faces 1\n 0 1 2 1 0 1 2 0\nendnode\nendmodelgeom test\ndonemodel test\n";
+        fs::write(&input, source).unwrap();
+        let compiler = bundled_model_compiler().unwrap();
+        assert_eq!(
+            fs::read(&compiler.path).unwrap(),
+            include_bytes!("../tools/windows/nwnmdlcomp.exe")
+        );
+        let output = input.with_extension("");
+        let status = Command::new(&compiler.path)
+            .arg("-cqe")
+            .arg(&input)
+            .arg(&output)
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(valid_compiled_model(&fs::read(output).unwrap()));
     }
 }

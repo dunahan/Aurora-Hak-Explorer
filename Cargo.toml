@@ -1,6 +1,6 @@
 [package]
 name = "aurora-hak-explorer"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "A native, open-source HAK/ERF archive explorer for Neverwinter Nights"
 license = "GPL-3.0-or-later"
@@ -25,6 +25,14 @@ windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse"]
 
 [build-dependencies]
 embed-resource = "3.0"
+
+# wayland-scanner 0.31.10 still requests quick-xml 0.39, which is affected by
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195. Its parser is compatible with the
+# fixed 0.41 series, so keep the upstream source locally with that one
+# dependency advanced until wayland-rs publishes the equivalent update.
+[patch.crates-io]
+drag = { path = "vendor/drag" }
+wayland-scanner = { path = "vendor/wayland-scanner" }
 
 [profile.release]
 lto = false

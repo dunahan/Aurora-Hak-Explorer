@@ -1,6 +1,6 @@
 # Aurora Hak Explorer
 
-Aurora Hak Explorer (AHE) is a native, dark-themed, open-source archive editor for Neverwinter Nights. It is intended as a modern Linux replacement for the classic `nwhak.exe` utility.
+Aurora Hak Explorer (AHE) is a native, dark-themed, open-source archive and model utility for Neverwinter Nights on Linux and Windows. It is intended as a modern replacement for the classic `nwhak.exe` workflow.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.
 
@@ -19,11 +19,14 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 - Switch between remembered System, Dark, and Light appearance modes (Dark by default)
 - Preview TGA, DDS, PLT, PNG, JPEG, BMP, GIF, TIFF, WebP, and other supported images in the Details pane
 - Preview MTR material files as text and inspect BMU/MP3 audio properties in the Details pane
-- Inspect ASCII source for uncompiled MDL models and summaries or extracted strings for compiled models
+- Render compiled and uncompiled MDL geometry with archive textures, inspect model metadata, and extract readable strings
+- Compile ASCII MDLs or decompile binary MDLs without launching Neverwinter Nights
+- Filter all, compiled, or uncompiled models directly from the Resource Tree
 - Reopen archives quickly from the remembered recent-files list
 - Remembered compact mode that hides the resource tree and details panes
 - Search and type-to-select, sortable columns, multi-selection, drag files in or out, and keyboard shortcuts
 - Export one or several selected resources from the right-click menu
+- Export selected resources with Ctrl+E
 - Copy, cut, and paste resources through the Linux file clipboard with Ctrl+C/Ctrl+X/Ctrl+V
 - Confirm resource conflicts individually or choose Replace All/Skip All during multi-file imports
 - Select every visible resource with Ctrl+A

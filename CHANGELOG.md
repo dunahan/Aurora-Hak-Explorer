@@ -2,6 +2,16 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.1.0 — 2026-07-18
+
+- Render compiled and uncompiled Aurora MDL geometry in the Details pane, with PLT, TGA, and DDS textures resolved from the open archive and nearby HAKs.
+- Compile ASCII models and decompile binary models without launching Neverwinter Nights, including multi-selection export actions.
+- Add Resource Tree filters for all, compiled, and uncompiled models.
+- Export any selected resources with Ctrl+E.
+- Keep sibling texture discovery responsive by indexing it in the background.
+- Harden model parsing against malformed hierarchies, excessive element counts, and unsafe allocations.
+- Embed the model compiler in the Windows application so the portable release remains a single executable.
+
 ## 1.0.0 — 2026-07-17
 
 - Close archive tabs by middle-clicking them.

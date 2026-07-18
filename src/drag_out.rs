@@ -6,8 +6,10 @@
 //! desktop or file manager requests them.
 
 use std::{
+    collections::VecDeque,
     os::unix::ffi::OsStrExt,
     path::PathBuf,
+    sync::{OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -106,11 +108,53 @@ pub fn start(_frame: &eframe::Frame, paths: Vec<PathBuf>, temporary_directory: T
         } else {
             // File managers commonly acknowledge XDND before their copy job
             // opens the source URI. Keep the exported files alive while that
-            // asynchronous job starts; dropping TempDir afterwards cleans up.
-            thread::sleep(Duration::from_secs(300));
+            // asynchronous job starts. A single bounded cleanup worker owns
+            // successful exports instead of leaving one sleeping thread per drag.
+            retain_temporary_directory(temporary_directory);
+            return;
         }
         drop(temporary_directory);
     });
+}
+
+fn retain_temporary_directory(directory: TempDir) {
+    const RETENTION: Duration = Duration::from_secs(300);
+    const MAX_RETAINED_EXPORTS: usize = 16;
+    static CLEANUP: OnceLock<mpsc::Sender<TempDir>> = OnceLock::new();
+    let sender = CLEANUP.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<TempDir>();
+        thread::spawn(move || {
+            let mut retained = VecDeque::<(Instant, TempDir)>::new();
+            loop {
+                let timeout = retained
+                    .front()
+                    .map(|(deadline, _)| deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::from_secs(3600));
+                match receiver.recv_timeout(timeout) {
+                    Ok(directory) => {
+                        retained.push_back((Instant::now() + RETENTION, directory));
+                        while retained.len() > MAX_RETAINED_EXPORTS {
+                            retained.pop_front();
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let now = Instant::now();
+                        while retained
+                            .front()
+                            .is_some_and(|(deadline, _)| *deadline <= now)
+                        {
+                            retained.pop_front();
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+        sender
+    });
+    if let Err(error) = sender.send(directory) {
+        drop(error.0);
+    }
 }
 
 fn run(paths: Vec<PathBuf>) -> Result<(), String> {

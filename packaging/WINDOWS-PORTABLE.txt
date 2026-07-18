@@ -1,4 +1,4 @@
-Aurora Hak Explorer 1.0.0 — Windows x86-64 portable build
+Aurora Hak Explorer 1.1.0 — Windows x86-64 portable build
 
 No installation is required. Run Aurora-Hak-Explorer.exe.
 
@@ -14,8 +14,10 @@ Please test with a COPY of an archive first:
 4. Save, close, reopen, and verify the resource names and counts.
 5. Check overwrite prompts and the unsaved-changes prompt.
 6. Enable View > Compact mode, restart Aurora, and confirm it is remembered.
+7. Preview an MDL, then compile or decompile a copy with the bundled helper.
 
 If something fails, please record the Windows version, the operation being
 performed, and the exact error message or a screenshot.
 
-Aurora Hak Explorer is licensed under GPL-3.0-or-later. See LICENSE.
+Aurora Hak Explorer is licensed under GPL-3.0-or-later. See LICENSE and
+THIRD_PARTY_NOTICES.md.

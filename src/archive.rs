@@ -2,6 +2,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 use crate::resource_types::{extension_for, type_for};
@@ -80,6 +81,7 @@ pub struct Entry {
     pub name: String,
     pub type_id: u16,
     pub data: EntryData,
+    model_compiled: OnceLock<Option<bool>>,
 }
 
 impl Entry {
@@ -102,6 +104,17 @@ impl Entry {
             EntryData::ExternalFile(path) => Ok(fs::metadata(path)?.len()),
             EntryData::Memory(data) => Ok(data.len() as u64),
         }
+    }
+    pub fn model_compiled(&self) -> Option<bool> {
+        *self.model_compiled.get_or_init(|| {
+            if self.extension() != "mdl" {
+                return None;
+            }
+            self.read_prefix(4)
+                .ok()
+                .filter(|prefix| prefix.len() == 4)
+                .map(|prefix| prefix == [0, 0, 0, 0])
+        })
     }
     fn copy_to(&self, output: &mut impl Write) -> io::Result<u64> {
         match &self.data {
@@ -351,7 +364,30 @@ impl Archive {
                     offset,
                     size,
                 },
+                model_compiled: OnceLock::new(),
             });
+        }
+        // Populate the model-kind cache using this already-open file. The
+        // Resource Tree can then count compiled and uncompiled models without
+        // opening the HAK once for every MDL on its first frame.
+        if let Some(model_type) = type_for("mdl") {
+            for entry in &entries {
+                if entry.type_id != model_type {
+                    continue;
+                }
+                let EntryData::ArchiveSlice { offset, size, .. } = &entry.data else {
+                    continue;
+                };
+                let compiled = if *size < 4 {
+                    None
+                } else {
+                    input.seek(SeekFrom::Start(*offset))?;
+                    let mut prefix = [0; 4];
+                    input.read_exact(&mut prefix)?;
+                    Some(prefix == [0, 0, 0, 0])
+                };
+                let _ = entry.model_compiled.set(compiled);
+            }
         }
         entries.sort_by_key(|e| (e.name.to_ascii_lowercase(), e.type_id));
         Ok(Self {
@@ -410,6 +446,7 @@ impl Archive {
             name,
             type_id,
             data: EntryData::ExternalFile(path.to_path_buf()),
+            model_compiled: OnceLock::new(),
         })
     }
 
@@ -640,6 +677,7 @@ mod tests {
             name: "sample".into(),
             type_id: 0x07e1,
             data: EntryData::Memory(b"2DA V2.0\n".to_vec()),
+            model_compiled: OnceLock::new(),
         });
         archive.save(&output).unwrap();
         let loaded = Archive::open(&output).unwrap();
@@ -700,6 +738,7 @@ mod tests {
             name: "sample".into(),
             type_id: 0x000a,
             data: EntryData::Memory(b"test".to_vec()),
+            model_compiled: OnceLock::new(),
         });
         archive.save(&path).unwrap();
 
@@ -729,6 +768,7 @@ mod tests {
             name: "../escape".into(),
             type_id: 0x000a,
             data: EntryData::Memory(b"must not escape".to_vec()),
+            model_compiled: OnceLock::new(),
         });
         assert!(archive.extract_all(&output).is_err());
         assert!(!dir.path().join("escape.txt").exists());
