@@ -146,6 +146,7 @@ struct HakEditor {
     selection_cursor: Option<usize>,
     hovered_drop_files: Vec<String>,
     pending_drop_files: Vec<PathBuf>,
+    internal_drag_origins: BTreeMap<PathBuf, InternalDragOrigin>,
     typeahead: String,
     typeahead_last: Option<Instant>,
     typeahead_pending: bool,
@@ -312,6 +313,11 @@ struct AddConflict {
     existing_filename: String,
 }
 
+#[derive(Clone)]
+struct InternalDragOrigin {
+    source_tab: usize,
+}
+
 struct AddBatch {
     target_tab: usize,
     selected_keys: BTreeSet<(String, u16)>,
@@ -433,6 +439,7 @@ impl HakEditor {
             selection_cursor: None,
             hovered_drop_files: Vec::new(),
             pending_drop_files: Vec::new(),
+            internal_drag_origins: BTreeMap::new(),
             typeahead: String::new(),
             typeahead_last: None,
             typeahead_pending: false,
@@ -1297,13 +1304,40 @@ impl HakEditor {
         };
         self.add_paths(paths);
     }
+    fn filter_same_archive_drag_paths(&mut self, paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+        let target_tab = self.active_tab;
+        let mut kept = Vec::with_capacity(paths.len());
+        let mut skipped = 0;
+        for path in paths {
+            let same_archive = path
+                .parent()
+                .and_then(|directory| self.internal_drag_origins.get(directory))
+                .is_some_and(|origin| internal_drag_returns_to_source(origin, target_tab));
+            if same_archive {
+                skipped += 1;
+            } else {
+                kept.push(path);
+            }
+        }
+        self.internal_drag_origins
+            .retain(|directory, _| directory.is_dir());
+        (kept, skipped)
+    }
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() || self.archive.is_none() {
+            return;
+        }
+        let (paths, same_archive_skipped) = self.filter_same_archive_drag_paths(paths);
+        if paths.is_empty() {
+            self.status = format!(
+                "Skipped {same_archive_skipped} resource(s) already present in this archive"
+            );
             return;
         }
         if let Some(batch) = self.pending_add.as_mut() {
             if self.active_tab == Some(batch.target_tab) {
                 batch.queue.extend(paths);
+                batch.skipped += same_archive_skipped;
             } else {
                 self.pending_drop_files.extend(paths);
             }
@@ -1313,7 +1347,9 @@ impl HakEditor {
             return;
         };
         let selected_keys = self.selected_resource_keys();
-        self.pending_add = Some(AddBatch::new(paths, target_tab, selected_keys));
+        let mut batch = AddBatch::new(paths, target_tab, selected_keys);
+        batch.skipped = same_archive_skipped;
+        self.pending_add = Some(batch);
         self.process_add_batch(ConflictAction::Continue);
     }
     fn process_add_batch(&mut self, action: ConflictAction) {
@@ -1717,6 +1753,9 @@ impl HakEditor {
         let Some(archive) = self.archive.as_ref() else {
             return;
         };
+        let Some(source_tab) = self.active_tab else {
+            return;
+        };
         if self.selected.is_empty() {
             return;
         }
@@ -1750,6 +1789,10 @@ impl HakEditor {
             return;
         }
         let count = paths.len();
+        self.internal_drag_origins.insert(
+            directory.path().to_path_buf(),
+            InternalDragOrigin { source_tab },
+        );
         drag_out::release_pointer_grab(frame);
         drag_out::start(frame, paths, directory);
         self.status = format!("Dragging {count} resource(s) — drop them into a folder");
@@ -4177,6 +4220,10 @@ fn is_archive_path(path: &std::path::Path) -> bool {
         })
 }
 
+fn internal_drag_returns_to_source(origin: &InternalDragOrigin, target_tab: Option<usize>) -> bool {
+    target_tab == Some(origin.source_tab)
+}
+
 fn category_for(extension: &str) -> &'static str {
     match extension {
         "2da" => "2DA",
@@ -5276,6 +5323,14 @@ mod clipboard_tests {
         let material = b"// material\nrenderhint NormalAndSpecMapped\ntexture0 mehrunes\ntexture1 mehrunes_n\n";
         assert_eq!(mtr_diffuse_texture(material).as_deref(), Some("mehrunes"));
         assert_eq!(mtr_diffuse_texture(b"texture0 null"), None);
+    }
+
+    #[test]
+    fn internal_drag_is_ignored_only_in_its_source_tab() {
+        let origin = InternalDragOrigin { source_tab: 3 };
+        assert!(internal_drag_returns_to_source(&origin, Some(3)));
+        assert!(!internal_drag_returns_to_source(&origin, Some(2)));
+        assert!(!internal_drag_returns_to_source(&origin, None));
     }
 
     #[test]
