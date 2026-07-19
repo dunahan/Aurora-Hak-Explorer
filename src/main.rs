@@ -2,6 +2,8 @@
 
 mod archive;
 #[cfg(target_os = "linux")]
+mod dnd_extract;
+#[cfg(target_os = "linux")]
 mod drag_out;
 #[cfg(target_os = "windows")]
 #[path = "drag_out_windows.rs"]
@@ -185,6 +187,8 @@ struct HakEditor {
     texture_dependencies: TextureDependencies,
     texture_dependency_receiver: Option<mpsc::Receiver<TextureDependencyResult>>,
     resource_view_cache: Option<ResourceViewCache>,
+    #[cfg(target_os = "linux")]
+    dnd_extract: Option<dnd_extract::Bridge>,
 }
 
 struct ImagePreviewCache {
@@ -494,6 +498,13 @@ impl HakEditor {
             texture_dependencies: BTreeMap::new(),
             texture_dependency_receiver: None,
             resource_view_cache: None,
+            #[cfg(target_os = "linux")]
+            dnd_extract: dnd_extract::Bridge::new()
+                .map_err(|error| {
+                    eprintln!("Could not enable KDE archive drag support: {error}");
+                    error
+                })
+                .ok(),
         }
     }
 
@@ -1906,6 +1917,18 @@ impl HakEditor {
             InternalDragOrigin { source_tab },
         );
         drag_out::release_pointer_grab(frame);
+        #[cfg(target_os = "linux")]
+        {
+            let archive_offer = self.dnd_extract.as_ref().map(|bridge| {
+                bridge.set_paths(paths.clone());
+                drag_out::ArchiveExtractOffer {
+                    service: bridge.service().to_owned(),
+                    path: bridge.path().to_owned(),
+                }
+            });
+            drag_out::start(frame, paths, directory, archive_offer);
+        }
+        #[cfg(target_os = "windows")]
         drag_out::start(frame, paths, directory);
         self.status = format!("Dragging {count} resource(s) — drop them into a folder");
     }

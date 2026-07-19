@@ -386,6 +386,7 @@ dependencies = [
  "winit",
  "x11-dl",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]
