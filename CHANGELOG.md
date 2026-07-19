@@ -6,6 +6,7 @@ All notable changes to Aurora Hak Explorer are recorded here.
 
 - Compile models in bounded batches with a shared workspace and dependency cache, greatly reducing helper-process and temporary-file overhead.
 - Keep AHE responsive during model compilation with progress reporting and cancellation.
+- Show live elapsed time and an adaptive estimated time remaining while models compile.
 - Cache the embedded Windows model compiler for the application session and suppress its transient console windows.
 - Reliably drag selections containing tens or hundreds of thousands of resources into KDE file managers using KIO's archive-extraction protocol.
 

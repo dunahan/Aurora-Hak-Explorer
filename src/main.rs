@@ -356,6 +356,7 @@ struct AddBatch {
 struct ModelCompileJob {
     receiver: mpsc::Receiver<ModelCompileEvent>,
     cancel: Arc<AtomicBool>,
+    started_at: Instant,
     completed: usize,
     total: usize,
     phase: String,
@@ -1733,6 +1734,7 @@ impl HakEditor {
         self.model_compile_job = Some(ModelCompileJob {
             receiver,
             cancel,
+            started_at: Instant::now(),
             completed: 0,
             total,
             phase: "Preparing models".into(),
@@ -3800,6 +3802,8 @@ impl eframe::App for HakEditor {
         if let Some(job) = self.model_compile_job.as_ref() {
             let mut cancel = false;
             let theme = self.active_theme(&ctx);
+            let elapsed = job.started_at.elapsed();
+            let remaining = estimated_time_remaining(elapsed, job.completed, job.total);
             let fraction = if job.total == 0 {
                 0.0
             } else {
@@ -3821,6 +3825,22 @@ impl eframe::App for HakEditor {
                             .show_percentage()
                             .text(format!("{} of {}", job.completed, job.total)),
                     );
+                    egui::Grid::new("model_compilation_timing")
+                        .num_columns(2)
+                        .spacing([28.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Time elapsed:");
+                            ui.label(format_compilation_duration(elapsed));
+                            ui.end_row();
+                            ui.label("Estimated time remaining:");
+                            ui.label(remaining.map_or_else(
+                                || "Calculating…".to_owned(),
+                                |duration| {
+                                    format!("About {}", format_compilation_duration(duration))
+                                },
+                            ));
+                            ui.end_row();
+                        });
                     ui.add_space(5.0);
                     ui.horizontal_centered(|ui| {
                         if ui
@@ -4726,6 +4746,38 @@ fn human_size(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn estimated_time_remaining(elapsed: Duration, completed: usize, total: usize) -> Option<Duration> {
+    if completed == 0 || total == 0 {
+        return None;
+    }
+    if completed >= total {
+        return Some(Duration::ZERO);
+    }
+
+    let seconds = elapsed.as_secs_f64() * (total - completed) as f64 / completed as f64;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs(
+        seconds.ceil().min(u64::MAX as f64) as u64
+    ))
+}
+
+fn format_compilation_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -5926,6 +5978,35 @@ fn split_2da_line(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod clipboard_tests {
     use super::*;
+
+    #[test]
+    fn compilation_times_are_formatted_readably() {
+        assert_eq!(format_compilation_duration(Duration::from_secs(5)), "5s");
+        assert_eq!(
+            format_compilation_duration(Duration::from_secs(65)),
+            "1m 05s"
+        );
+        assert_eq!(
+            format_compilation_duration(Duration::from_secs(3_661)),
+            "1h 01m 01s"
+        );
+    }
+
+    #[test]
+    fn compilation_eta_uses_completed_work_rate() {
+        assert_eq!(
+            estimated_time_remaining(Duration::from_secs(20), 0, 100),
+            None
+        );
+        assert_eq!(
+            estimated_time_remaining(Duration::from_secs(20), 20, 100),
+            Some(Duration::from_secs(80))
+        );
+        assert_eq!(
+            estimated_time_remaining(Duration::from_secs(20), 100, 100),
+            Some(Duration::ZERO)
+        );
+    }
 
     #[test]
     fn dotted_extensions_match_resource_filters() {
