@@ -12,9 +12,10 @@ mod drag_out;
 mod game_resources;
 mod mdl;
 mod resource_types;
+mod save_cleanup;
 mod single_instance;
 
-use archive::{Archive, ArchiveKind, ArchiveVersion, Entry};
+use archive::{Archive, ArchiveKind, ArchiveVersion, Entry, EntryData};
 use eframe::egui::{self, Color32, RichText};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -43,6 +44,8 @@ const IMPORT_MIN_FILES_PER_FRAME: usize = 256;
 const IMPORT_MAX_FILES_PER_FRAME: usize = 4096;
 const IMPORT_FRAME_BUDGET: Duration = Duration::from_millis(8);
 const MAX_DROPPED_DIRECTORY_FILES: usize = 1_000_000;
+const MAX_UNDO_STEPS: usize = 32;
+const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
 const DISPLAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 type TextureDependencies = BTreeMap<String, Vec<archive::Entry>>;
 type TextureDependencyResult = (PathBuf, TextureDependencies);
@@ -107,6 +110,7 @@ fn main() -> eframe::Result {
         single_instance::Launch::Forwarded => return Ok(()),
         single_instance::Launch::Primary(receiver) => {
             drag_cleanup::recover_abandoned();
+            save_cleanup::recover_abandoned();
             receiver
         }
     };
@@ -163,6 +167,7 @@ struct HakEditor {
     status: String,
     error: Option<String>,
     dirty: bool,
+    edit_history: EditHistory,
     show_about: bool,
     show_new: bool,
     new_kind: ArchiveKind,
@@ -370,6 +375,89 @@ struct AddBatch {
     skipped: usize,
     failures: Vec<String>,
     entry_lookup: HashMap<(String, u16), usize>,
+    changes: HashMap<(String, u16), ResourceChange>,
+    dirty_before: bool,
+    category_before: Option<String>,
+}
+
+#[derive(Clone)]
+struct ResourceChange {
+    key: (String, u16),
+    before: Option<Entry>,
+    after: Option<Entry>,
+}
+
+#[derive(Clone)]
+enum ArchiveEdit {
+    Resources(Vec<ResourceChange>),
+    Description { before: String, after: String },
+}
+
+#[derive(Clone)]
+struct EditTransaction {
+    label: String,
+    edit: ArchiveEdit,
+    selected_before: BTreeSet<(String, u16)>,
+    selected_after: BTreeSet<(String, u16)>,
+    category_before: Option<String>,
+    category_after: Option<String>,
+    dirty_before: bool,
+    dirty_after: bool,
+    estimated_bytes: usize,
+}
+
+#[derive(Clone, Default)]
+struct EditHistory {
+    undo: VecDeque<EditTransaction>,
+    redo: VecDeque<EditTransaction>,
+    estimated_bytes: usize,
+}
+
+impl EditHistory {
+    fn record(&mut self, transaction: EditTransaction) -> bool {
+        self.clear_redo();
+        if transaction.estimated_bytes > MAX_UNDO_BYTES {
+            self.clear();
+            return false;
+        }
+        self.estimated_bytes = self
+            .estimated_bytes
+            .saturating_add(transaction.estimated_bytes);
+        self.undo.push_back(transaction);
+        while self.undo.len() > MAX_UNDO_STEPS || self.estimated_bytes > MAX_UNDO_BYTES {
+            let Some(expired) = self.undo.pop_front() else {
+                break;
+            };
+            self.estimated_bytes = self.estimated_bytes.saturating_sub(expired.estimated_bytes);
+        }
+        true
+    }
+
+    fn clear_redo(&mut self) {
+        while let Some(transaction) = self.redo.pop_front() {
+            self.estimated_bytes = self
+                .estimated_bytes
+                .saturating_sub(transaction.estimated_bytes);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.estimated_bytes = 0;
+    }
+
+    fn undo_label(&self) -> Option<&str> {
+        self.undo
+            .back()
+            .map(|transaction| transaction.label.as_str())
+    }
+
+    fn redo_label(&self) -> Option<&str> {
+        self.redo
+            .back()
+            .map(|transaction| transaction.label.as_str())
+    }
 }
 
 struct ModelCompileJob {
@@ -407,6 +495,8 @@ impl AddBatch {
         target_tab: usize,
         selected_keys: BTreeSet<(String, u16)>,
         archive: &Archive,
+        dirty_before: bool,
+        category_before: Option<String>,
     ) -> Self {
         let entry_lookup = archive
             .entries
@@ -425,6 +515,9 @@ impl AddBatch {
             skipped: 0,
             failures: Vec::new(),
             entry_lookup,
+            changes: HashMap::new(),
+            dirty_before,
+            category_before,
         }
     }
 }
@@ -435,6 +528,7 @@ struct TabState {
     selected: BTreeSet<usize>,
     filter: String,
     dirty: bool,
+    edit_history: EditHistory,
     category: Option<String>,
     sort_column: SortColumn,
     sort_ascending: bool,
@@ -449,6 +543,7 @@ impl TabState {
             selected: BTreeSet::new(),
             filter: String::new(),
             dirty,
+            edit_history: EditHistory::default(),
             category: None,
             sort_column: SortColumn::Name,
             sort_ascending: true,
@@ -516,6 +611,7 @@ impl HakEditor {
             status: "Ready — open an archive or create a new one".into(),
             error: None,
             dirty: false,
+            edit_history: EditHistory::default(),
             show_about: false,
             show_new: false,
             new_kind: ArchiveKind::Hak,
@@ -1145,6 +1241,7 @@ impl HakEditor {
             selected: self.selected.clone(),
             filter: self.filter.clone(),
             dirty: self.dirty,
+            edit_history: self.edit_history.clone(),
             category: self.category.clone(),
             sort_column: self.sort_column,
             sort_ascending: self.sort_ascending,
@@ -1204,6 +1301,88 @@ impl HakEditor {
         self.selection_anchor = self.selected.first().copied();
         self.selection_cursor = self.selected.last().copied();
     }
+
+    fn record_edit(&mut self, mut transaction: EditTransaction) -> bool {
+        transaction.estimated_bytes = estimate_transaction_bytes(&transaction);
+        self.edit_history.record(transaction)
+    }
+
+    fn record_add_batch(&mut self, batch: &mut AddBatch) -> bool {
+        let changed = batch.added + batch.replaced;
+        let transaction = resource_transaction(
+            format!("import of {changed} resource(s)"),
+            std::mem::take(&mut batch.changes).into_values().collect(),
+            batch.selected_keys.clone(),
+            self.selected_resource_keys(),
+            batch.category_before.clone(),
+            self.category.clone(),
+            batch.dirty_before,
+        );
+        self.record_edit(transaction)
+    }
+
+    fn undo_edit(&mut self) {
+        let Some(transaction) = self.edit_history.undo.pop_back() else {
+            return;
+        };
+        match self.apply_edit_transaction(&transaction, false) {
+            Ok(()) => {
+                self.status = format!("Undid {}", transaction.label);
+                self.edit_history.redo.push_back(transaction);
+            }
+            Err(error) => {
+                self.edit_history.undo.push_back(transaction);
+                self.error = Some(format!("Could not undo the edit: {error}"));
+            }
+        }
+    }
+
+    fn redo_edit(&mut self) {
+        let Some(transaction) = self.edit_history.redo.pop_back() else {
+            return;
+        };
+        match self.apply_edit_transaction(&transaction, true) {
+            Ok(()) => {
+                self.status = format!("Redid {}", transaction.label);
+                self.edit_history.undo.push_back(transaction);
+            }
+            Err(error) => {
+                self.edit_history.redo.push_back(transaction);
+                self.error = Some(format!("Could not redo the edit: {error}"));
+            }
+        }
+    }
+
+    fn apply_edit_transaction(
+        &mut self,
+        transaction: &EditTransaction,
+        redo: bool,
+    ) -> Result<(), String> {
+        let Some(archive) = self.archive.as_mut() else {
+            return Err("no archive is open".into());
+        };
+        apply_archive_edit(archive, &transaction.edit, redo)?;
+        self.dirty = if redo {
+            transaction.dirty_after
+        } else {
+            transaction.dirty_before
+        };
+        self.category = if redo {
+            transaction.category_after.clone()
+        } else {
+            transaction.category_before.clone()
+        };
+        let selected = if redo {
+            &transaction.selected_after
+        } else {
+            &transaction.selected_before
+        };
+        self.restore_selection_by_keys(selected);
+        self.resource_view_cache = None;
+        self.image_preview = None;
+        self.model_preview = None;
+        Ok(())
+    }
     fn load_tab(&mut self, index: usize) {
         let Some(tab) = self.tabs.get(index).cloned() else {
             return;
@@ -1212,6 +1391,7 @@ impl HakEditor {
         self.selected = tab.selected;
         self.filter = tab.filter;
         self.dirty = tab.dirty;
+        self.edit_history = tab.edit_history;
         self.category = tab.category;
         self.sort_column = tab.sort_column;
         self.sort_ascending = tab.sort_ascending;
@@ -1250,6 +1430,7 @@ impl HakEditor {
             self.filter.clear();
             self.category = None;
             self.dirty = false;
+            self.edit_history.clear();
             self.active_tab = None;
             self.status = "Ready — open an archive or create a new one".into();
             return;
@@ -1279,7 +1460,7 @@ impl HakEditor {
         }
     }
     fn request_quit(&mut self) {
-        if let Some(batch) = self.pending_add.take() {
+        if let Some(mut batch) = self.pending_add.take() {
             if batch.added + batch.replaced > 0 {
                 if let Some(archive) = self.archive.as_mut() {
                     archive.finish_bulk_add();
@@ -1287,6 +1468,7 @@ impl HakEditor {
                 self.dirty = true;
                 let selected_keys = batch.selected_keys.clone();
                 self.restore_selection_by_keys(&selected_keys);
+                let _ = self.record_add_batch(&mut batch);
             }
             self.status = format!(
                 "Import canceled — added {}, replaced {}, skipped {}",
@@ -1405,6 +1587,7 @@ impl HakEditor {
         match archive.save(&path) {
             Ok(()) => {
                 self.dirty = false;
+                self.edit_history.clear();
                 self.status = format!("Saved {}", path.display());
                 // Saving can change the archive path and replace external
                 // entries with archive slices. Update the tab once here
@@ -1475,7 +1658,14 @@ impl HakEditor {
         let Some(archive) = self.archive.as_ref() else {
             return;
         };
-        let mut batch = AddBatch::new(paths, target_tab, selected_keys, archive);
+        let mut batch = AddBatch::new(
+            paths,
+            target_tab,
+            selected_keys,
+            archive,
+            self.dirty,
+            self.category.clone(),
+        );
         batch.skipped = same_archive_skipped;
         self.pending_add = Some(batch);
         self.process_add_batch(ConflictAction::Continue);
@@ -1606,6 +1796,7 @@ impl HakEditor {
                 let selected_keys = batch.selected_keys.clone();
                 self.restore_selection_by_keys(&selected_keys);
             }
+            let history_recorded = !changed || self.record_add_batch(&mut batch);
             self.status = if canceled {
                 format!(
                     "Import canceled — added {}, replaced {}, skipped {}",
@@ -1619,6 +1810,10 @@ impl HakEditor {
             };
             if !batch.failures.is_empty() {
                 self.error = Some(summarize_import_failures(&batch.failures));
+            }
+            if !history_recorded {
+                self.status
+                    .push_str(" — operation exceeded the bounded undo-history limit");
             }
         }
     }
@@ -1669,9 +1864,32 @@ impl HakEditor {
         match Archive::open(&path) {
             Ok(other) => {
                 let selected_keys = self.selected_resource_keys();
+                let dirty_before = self.dirty;
+                let category_before = self.category.clone();
                 let Some(current) = self.archive.as_mut() else {
                     return;
                 };
+                let mut changes = BTreeMap::new();
+                for incoming in &other.entries {
+                    let key = (incoming.name.to_ascii_lowercase(), incoming.type_id);
+                    let before = current
+                        .entries
+                        .iter()
+                        .find(|entry| {
+                            entry.type_id == key.1 && entry.name.eq_ignore_ascii_case(&key.0)
+                        })
+                        .cloned();
+                    changes
+                        .entry(key.clone())
+                        .and_modify(|change: &mut ResourceChange| {
+                            change.after = Some(incoming.clone());
+                        })
+                        .or_insert(ResourceChange {
+                            key,
+                            before,
+                            after: Some(incoming.clone()),
+                        });
+                }
                 let (added, replaced) = current.merge(&other);
                 self.dirty |= added + replaced > 0;
                 if added + replaced > 0 {
@@ -1682,6 +1900,21 @@ impl HakEditor {
                     "Merged {}: {added} added, {replaced} replaced",
                     path.display()
                 );
+                if added + replaced > 0 {
+                    let transaction = resource_transaction(
+                        format!("merge of {} resource(s)", added + replaced),
+                        changes.into_values().collect(),
+                        selected_keys,
+                        self.selected_resource_keys(),
+                        category_before,
+                        self.category.clone(),
+                        dirty_before,
+                    );
+                    if !self.record_edit(transaction) {
+                        self.status
+                            .push_str(" — operation exceeded the bounded undo-history limit");
+                    }
+                }
             }
             Err(e) => self.fail("Could not merge archive", e),
         }
@@ -2140,7 +2373,7 @@ impl HakEditor {
         }
     }
     fn delete_selected(&mut self) {
-        let Some(archive) = self.archive.as_mut() else {
+        let Some(archive) = self.archive.as_ref() else {
             return;
         };
         if !archive.kind.is_editable() {
@@ -2150,7 +2383,21 @@ impl HakEditor {
         if self.selected.is_empty() {
             return;
         }
+        let selected_before = self.selected_resource_keys();
+        let category_before = self.category.clone();
+        let dirty_before = self.dirty;
+        let changes = self
+            .selected
+            .iter()
+            .filter_map(|index| archive.entries.get(*index))
+            .map(|entry| ResourceChange {
+                key: (entry.name.to_ascii_lowercase(), entry.type_id),
+                before: Some(entry.clone()),
+                after: None,
+            })
+            .collect::<Vec<_>>();
         let count = self.selected.len();
+        let archive = self.archive.as_mut().unwrap();
         archive.entries = archive
             .entries
             .iter()
@@ -2165,6 +2412,19 @@ impl HakEditor {
         self.category = None;
         self.dirty = true;
         self.status = format!("Removed {count} resources — save to commit changes");
+        let transaction = resource_transaction(
+            format!("deletion of {count} resource(s)"),
+            changes,
+            selected_before,
+            BTreeSet::new(),
+            category_before,
+            None,
+            dirty_before,
+        );
+        if !self.record_edit(transaction) {
+            self.status
+                .push_str(" — operation exceeded the bounded undo-history limit");
+        }
     }
     fn new_archive(&mut self) {
         let archive = Archive::new(self.new_kind, self.new_version);
@@ -2497,6 +2757,35 @@ impl eframe::App for HakEditor {
                     }
                 });
                 ui.menu_button("Edit", |ui| {
+                    let undo_label = self.edit_history.undo_label().map_or_else(
+                        || "Undo   Ctrl+Z".to_owned(),
+                        |label| format!("Undo {label}   Ctrl+Z"),
+                    );
+                    if ui
+                        .add_enabled(
+                            self.edit_history.undo_label().is_some(),
+                            egui::Button::new(undo_label),
+                        )
+                        .clicked()
+                    {
+                        self.undo_edit();
+                        ui.close();
+                    }
+                    let redo_label = self.edit_history.redo_label().map_or_else(
+                        || "Redo   Ctrl+Shift+Z".to_owned(),
+                        |label| format!("Redo {label}   Ctrl+Shift+Z"),
+                    );
+                    if ui
+                        .add_enabled(
+                            self.edit_history.redo_label().is_some(),
+                            egui::Button::new(redo_label),
+                        )
+                        .clicked()
+                    {
+                        self.redo_edit();
+                        ui.close();
+                    }
+                    ui.separator();
                     let has_selection = !self.selected.is_empty();
                     if ui
                         .add_enabled(has_selection, egui::Button::new("Copy   Ctrl+C"))
@@ -2928,6 +3217,11 @@ impl eframe::App for HakEditor {
                 shift: true,
                 ..Default::default()
             };
+            if ctx.input_mut(|i| i.consume_key(ctrl_shift, egui::Key::Z)) {
+                self.redo_edit();
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) {
+                self.undo_edit();
+            }
             if ctx.input_mut(|i| i.consume_key(ctrl_shift, egui::Key::S)) {
                 self.save(true);
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
@@ -3081,7 +3375,12 @@ impl eframe::App for HakEditor {
                             self.selection_anchor = None;
                             self.selection_cursor = None;
                         }
-                        for (category, amount) in categories.into_iter().flatten() {
+                        let mut category_rows =
+                            categories.into_iter().flatten().collect::<Vec<_>>();
+                        category_rows.sort_by_key(|(category, _)| {
+                            (category.as_str() == "Other", category.as_str())
+                        });
+                        for (category, amount) in category_rows {
                             if category == "Models" {
                                 for (label, count) in [
                                     ("Models All", *amount),
@@ -3140,7 +3439,20 @@ impl eframe::App for HakEditor {
                     ui.separator();
                     if let Some(entry) = &selected_entry {
                         let entry_size = entry.size().unwrap_or(0);
-                        ui.heading(entry.filename());
+                        let extension = entry.extension();
+                        let tileset_name = if extension == "set" {
+                            entry
+                                .read_prefix(256 * 1024)
+                                .ok()
+                                .and_then(|bytes| tileset_unlocalized_name(&bytes))
+                        } else {
+                            None
+                        };
+                        let title = tileset_name.map_or_else(
+                            || entry.filename(),
+                            |name| format!("{} — {name}", entry.filename()),
+                        );
+                        ui.heading(title);
                         ui.horizontal_wrapped(|ui| {
                             ui.label(format!("Type: {}", entry.extension().to_ascii_uppercase()));
                             ui.separator();
@@ -3158,7 +3470,6 @@ impl eframe::App for HakEditor {
                         ui.add_space(8.0);
                         ui.group(|ui| {
                             ui.set_min_height(300.0);
-                            let extension = entry.extension();
                             if is_previewable_image(&extension) {
                                 self.show_image_preview(ui, entry);
                             } else if extension == "mdl" {
@@ -3809,9 +4120,35 @@ impl eframe::App for HakEditor {
                 cancel = true;
             }
             if apply {
-                if let Some(archive) = self.archive.as_mut() {
-                    archive.set_description(self.description_buffer.clone());
+                let before = self.archive.as_ref().map(Archive::description);
+                if let Some(before) = before
+                    && before != self.description_buffer
+                {
+                    let selected = self.selected_resource_keys();
+                    let category = self.category.clone();
+                    let transaction = EditTransaction {
+                        label: "archive description change".into(),
+                        edit: ArchiveEdit::Description {
+                            before,
+                            after: self.description_buffer.clone(),
+                        },
+                        selected_before: selected.clone(),
+                        selected_after: selected,
+                        category_before: category.clone(),
+                        category_after: category,
+                        dirty_before: self.dirty,
+                        dirty_after: true,
+                        estimated_bytes: 0,
+                    };
+                    if let Some(archive) = self.archive.as_mut() {
+                        archive.set_description(self.description_buffer.clone());
+                    }
                     self.dirty = true;
+                    self.status = "Updated archive description".into();
+                    if !self.record_edit(transaction) {
+                        self.status
+                            .push_str(" — operation exceeded the bounded undo-history limit");
+                    }
                 }
                 self.show_description = false;
             } else if cancel {
@@ -4818,16 +5155,13 @@ fn compile_prepared_batch(
         .map_err(|error| format!("could not write compiler batch manifest: {error}"))?;
     let output = run_model_compiler_batch(compiler, workspace, &manifest, cancel)?;
     let diagnostics = compiler_diagnostics(&output.stdout, &output.stderr);
+    let mut diagnostics_reported = false;
 
     for model in batch.drain(..) {
         let output_path = model.input.with_extension("");
         let result = (|| -> Result<(), String> {
             let compiled = fs::read(&output_path).map_err(|error| {
-                if diagnostics.is_empty() {
-                    format!("compiler did not create an output model: {error}")
-                } else {
-                    format!("compiler did not create an output model: {diagnostics}")
-                }
+                missing_compiler_output_error(&error, &diagnostics, &mut diagnostics_reported)
             })?;
             if !valid_compiled_model(&compiled) {
                 return Err("compiler output was not a valid binary MDL".into());
@@ -4980,6 +5314,24 @@ fn compiler_diagnostics(stdout: &[u8], stderr: &[u8]) -> String {
     diagnostics
 }
 
+fn missing_compiler_output_error(
+    error: &std::io::Error,
+    diagnostics: &str,
+    diagnostics_reported: &mut bool,
+) -> String {
+    if diagnostics.is_empty() {
+        format!("compiler did not create an output model: {error}")
+    } else if *diagnostics_reported {
+        format!(
+            "compiler did not create an output model: {error} \
+             (batch diagnostics reported with the first failed model)"
+        )
+    } else {
+        *diagnostics_reported = true;
+        format!("compiler did not create an output model: {diagnostics}")
+    }
+}
+
 fn valid_compiled_model(bytes: &[u8]) -> bool {
     if bytes.len() < 12 || bytes[..4] != [0, 0, 0, 0] {
         return false;
@@ -5023,13 +5375,34 @@ fn add_incoming(
     entry: Entry,
     replacement_index: Option<usize>,
 ) -> bool {
+    let key = Archive::incoming_entry_identity(&entry);
+    let before = replacement_index.and_then(|index| archive.entries.get(index).cloned());
+    let after = entry.clone();
     match archive.add_prepared_entry_unsorted(entry, replacement_index) {
         Ok(true) => {
             batch.replaced += 1;
+            batch
+                .changes
+                .entry(key.clone())
+                .and_modify(|change| change.after = Some(after.clone()))
+                .or_insert(ResourceChange {
+                    key,
+                    before,
+                    after: Some(after),
+                });
             true
         }
         Ok(false) => {
             batch.added += 1;
+            batch
+                .changes
+                .entry(key.clone())
+                .and_modify(|change| change.after = Some(after.clone()))
+                .or_insert(ResourceChange {
+                    key,
+                    before,
+                    after: Some(after),
+                });
             true
         }
         Err(error) => {
@@ -5037,6 +5410,138 @@ fn add_incoming(
             false
         }
     }
+}
+
+fn resource_transaction(
+    label: String,
+    changes: Vec<ResourceChange>,
+    selected_before: BTreeSet<(String, u16)>,
+    selected_after: BTreeSet<(String, u16)>,
+    category_before: Option<String>,
+    category_after: Option<String>,
+    dirty_before: bool,
+) -> EditTransaction {
+    EditTransaction {
+        label,
+        edit: ArchiveEdit::Resources(changes),
+        selected_before,
+        selected_after,
+        category_before,
+        category_after,
+        dirty_before,
+        dirty_after: true,
+        estimated_bytes: 0,
+    }
+}
+
+fn apply_archive_edit(archive: &mut Archive, edit: &ArchiveEdit, redo: bool) -> Result<(), String> {
+    match edit {
+        ArchiveEdit::Resources(changes) => {
+            for entry in changes.iter().filter_map(|change| {
+                if redo {
+                    change.after.as_ref()
+                } else {
+                    change.before.as_ref()
+                }
+            }) {
+                validate_history_entry(entry)?;
+            }
+            for change in changes {
+                let index = archive.entries.iter().position(|entry| {
+                    entry.type_id == change.key.1 && entry.name.eq_ignore_ascii_case(&change.key.0)
+                });
+                let target = if redo {
+                    change.after.as_ref()
+                } else {
+                    change.before.as_ref()
+                };
+                match (index, target) {
+                    (Some(index), Some(entry)) => archive.entries[index] = entry.clone(),
+                    (Some(index), None) => {
+                        archive.entries.remove(index);
+                    }
+                    (None, Some(entry)) => archive.entries.push(entry.clone()),
+                    (None, None) => {}
+                }
+            }
+            archive.finish_bulk_add();
+        }
+        ArchiveEdit::Description { before, after } => {
+            archive.set_description(if redo { after.clone() } else { before.clone() });
+        }
+    }
+    Ok(())
+}
+
+fn validate_history_entry(entry: &Entry) -> Result<(), String> {
+    match &entry.data {
+        EntryData::ArchiveSlice { path, offset, size } => {
+            let length = fs::metadata(path)
+                .map_err(|error| format!("{} is unavailable: {error}", path.display()))?
+                .len();
+            if offset.checked_add(*size).is_none_or(|end| end > length) {
+                return Err(format!(
+                    "{} no longer contains the recorded resource data",
+                    path.display()
+                ));
+            }
+        }
+        EntryData::ExternalFile(path) => {
+            if !fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+                return Err(format!("{} is no longer available", path.display()));
+            }
+        }
+        EntryData::Memory(_) => {}
+    }
+    Ok(())
+}
+
+fn estimate_transaction_bytes(transaction: &EditTransaction) -> usize {
+    let mut bytes = std::mem::size_of::<EditTransaction>()
+        .saturating_add(transaction.label.len())
+        .saturating_add(estimate_keys(&transaction.selected_before))
+        .saturating_add(estimate_keys(&transaction.selected_after))
+        .saturating_add(transaction.category_before.as_ref().map_or(0, String::len))
+        .saturating_add(transaction.category_after.as_ref().map_or(0, String::len));
+    match &transaction.edit {
+        ArchiveEdit::Resources(changes) => {
+            bytes = bytes.saturating_add(
+                changes
+                    .iter()
+                    .map(|change| {
+                        std::mem::size_of::<ResourceChange>()
+                            .saturating_add(change.key.0.len())
+                            .saturating_add(change.before.as_ref().map_or(0, estimate_entry_bytes))
+                            .saturating_add(change.after.as_ref().map_or(0, estimate_entry_bytes))
+                    })
+                    .fold(0usize, usize::saturating_add),
+            );
+        }
+        ArchiveEdit::Description { before, after } => {
+            bytes = bytes
+                .saturating_add(before.len())
+                .saturating_add(after.len());
+        }
+    }
+    bytes
+}
+
+fn estimate_keys(keys: &BTreeSet<(String, u16)>) -> usize {
+    keys.iter()
+        .map(|(name, _)| std::mem::size_of::<(String, u16)>().saturating_add(name.len()))
+        .fold(0usize, usize::saturating_add)
+}
+
+fn estimate_entry_bytes(entry: &Entry) -> usize {
+    let data = match &entry.data {
+        EntryData::ArchiveSlice { path, .. } | EntryData::ExternalFile(path) => {
+            path.to_string_lossy().len()
+        }
+        EntryData::Memory(bytes) => bytes.len(),
+    };
+    std::mem::size_of::<Entry>()
+        .saturating_add(entry.name.len())
+        .saturating_add(data)
 }
 
 fn summarize_import_failures(failures: &[String]) -> String {
@@ -5281,10 +5786,11 @@ fn prune_internal_drag_origins(origins: &mut BTreeMap<PathBuf, InternalDragOrigi
 fn category_for(extension: &str) -> &'static str {
     match extension {
         "2da" => "2DA",
+        "set" => "Tileset",
         "nss" | "ncs" => "Scripts",
         "mdl" | "mtr" | "wok" | "pwk" | "dwk" => "Models",
         "tga" | "dds" | "plt" | "txi" | "bmp" | "jpg" | "png" | "ktx" => "Textures",
-        "wav" | "mp3" | "ogg" | "bmu" => "Sounds",
+        "wav" | "mp3" | "ogg" | "bmu" => "Music",
         "are" | "git" | "gic" => "Areas",
         "utc" | "bic" => "Creatures",
         "uti" | "utp" | "utd" | "utw" | "utt" | "uts" | "ute" | "utm" | "utg" => "Blueprints",
@@ -5294,6 +5800,17 @@ fn category_for(extension: &str) -> &'static str {
         "ifo" | "jrl" | "fac" | "itp" => "Module Data",
         _ => "Other",
     }
+}
+
+fn tileset_unlocalized_name(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes).lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case("UnlocalizedName")
+            .then(|| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 fn entry_matches_category(entry: &archive::Entry, category: Option<&str>) -> bool {
@@ -5369,16 +5886,19 @@ fn show_model_scene(
         ui.available_width().max(160.0),
         ui.available_height().max(300.0),
     );
-    let (response, painter) = ui.allocate_painter(desired, egui::Sense::drag());
+    let (response, painter) = ui.allocate_painter(desired, egui::Sense::click_and_drag());
     let rect = response.rect.shrink(8.0);
-    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+    painter.rect_filled(rect, 4.0, Color32::from_rgb(16, 20, 23));
     painter.rect_stroke(
         rect,
         4.0,
         egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
         egui::StrokeKind::Inside,
     );
-    if response.dragged() {
+    draw_model_viewport_grid(&painter, rect);
+    if response.double_clicked_by(egui::PointerButton::Primary) {
+        reset_model_view(yaw, pitch, zoom);
+    } else if response.dragged_by(egui::PointerButton::Primary) {
         let delta = ui.ctx().input(|input| input.pointer.delta());
         *yaw += delta.x * 0.012;
         *pitch = (*pitch + delta.y * 0.012).clamp(-1.5, 1.5);
@@ -5392,12 +5912,6 @@ fn show_model_scene(
             *zoom = (*zoom * (scroll * 0.0025).exp()).clamp(0.15, 8.0);
         }
     }
-    if response.double_clicked() {
-        *yaw = -0.65;
-        *pitch = 0.35;
-        *zoom = 1.0;
-    }
-
     let center = [
         (scene.bounds_min[0] + scene.bounds_max[0]) * 0.5,
         (scene.bounds_min[1] + scene.bounds_max[1]) * 0.5,
@@ -5495,13 +6009,9 @@ fn show_model_scene(
             let illumination =
                 ((normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]) / length)
                     .abs()
-                    .mul_add(0.68, 0.24)
-                    .clamp(0.12, 1.0);
-            let color = Color32::from_rgb(
-                (mesh.color[0] * illumination * 255.0) as u8,
-                (mesh.color[1] * illumination * 255.0) as u8,
-                (mesh.color[2] * illumination * 255.0) as u8,
-            );
+                    .mul_add(0.62, 0.32)
+                    .clamp(0.22, 1.0);
+            let color = visible_model_color(mesh.color, illumination);
             let vertex_colors = face.map(|index| {
                 let vertex_illumination = rotated_normals
                     .get(index as usize)
@@ -5580,6 +6090,80 @@ fn show_model_scene(
         egui::FontId::proportional(11.0),
         ui.visuals().weak_text_color(),
     );
+}
+
+fn draw_model_viewport_grid(painter: &egui::Painter, rect: egui::Rect) {
+    const GRID_SPACING: f32 = 32.0;
+    let grid = egui::Stroke::new(1.0, Color32::from_rgb(24, 31, 36));
+    let axis = egui::Stroke::new(1.0, Color32::from_rgb(37, 52, 60));
+    let center = rect.center();
+    let mut x = center.x;
+    while x >= rect.left() {
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            grid,
+        );
+        x -= GRID_SPACING;
+    }
+    let mut x = center.x + GRID_SPACING;
+    while x <= rect.right() {
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            grid,
+        );
+        x += GRID_SPACING;
+    }
+    let mut y = center.y;
+    while y >= rect.top() {
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            grid,
+        );
+        y -= GRID_SPACING;
+    }
+    let mut y = center.y + GRID_SPACING;
+    while y <= rect.bottom() {
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            grid,
+        );
+        y += GRID_SPACING;
+    }
+    painter.line_segment(
+        [
+            egui::pos2(center.x, rect.top()),
+            egui::pos2(center.x, rect.bottom()),
+        ],
+        axis,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), center.y),
+            egui::pos2(rect.right(), center.y),
+        ],
+        axis,
+    );
+}
+
+fn visible_model_color(material: [f32; 3], illumination: f32) -> Color32 {
+    let material = material.map(|channel| channel.clamp(0.0, 1.0));
+    let luminance = material[0] * 0.2126 + material[1] * 0.7152 + material[2] * 0.0722;
+    let fallback_weight = ((0.18 - luminance) / 0.18).clamp(0.0, 1.0);
+    let fallback = [0.48, 0.56, 0.61];
+    Color32::from_rgb(
+        ((material[0] + (fallback[0] - material[0]) * fallback_weight) * illumination * 255.0)
+            as u8,
+        ((material[1] + (fallback[1] - material[1]) * fallback_weight) * illumination * 255.0)
+            as u8,
+        ((material[2] + (fallback[2] - material[2]) * fallback_weight) * illumination * 255.0)
+            as u8,
+    )
+}
+
+fn reset_model_view(yaw: &mut f32, pitch: &mut f32, zoom: &mut f32) {
+    *yaw = -0.65;
+    *pitch = 0.35;
+    *zoom = 1.0;
 }
 
 fn decode_model_preview(bytes: &[u8], total_size: u64) -> Result<ModelPreview, String> {
@@ -6557,6 +7141,13 @@ mod clipboard_tests {
         assert_eq!(image_format_for("mdl"), None);
         assert!(is_previewable_image("plt"));
         assert_eq!(category_for("plt"), "Textures");
+        assert_eq!(category_for("set"), "Tileset");
+        assert_eq!(category_for("bmu"), "Music");
+        assert_eq!(
+            tileset_unlocalized_name(b"[GENERAL]\nUnlocalizedName=DDIWD: Frozen Interiors\n"),
+            Some("DDIWD: Frozen Interiors".into())
+        );
+        assert_eq!(tileset_unlocalized_name(b"UnlocalizedName=\n"), None);
         assert!(is_text_type("mtr"));
         assert!(is_text_type("lua"));
         assert!(is_text_type("ids"));
@@ -6869,6 +7460,144 @@ mod clipboard_tests {
         assert!(valid_compiled_model(
             &fs::read(workspace.path().join("second.mdl")).unwrap()
         ));
+    }
+
+    #[test]
+    fn batch_compiler_diagnostics_are_reported_only_once() {
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "missing output");
+        let diagnostics = "compiler diagnostic details";
+        let mut reported = false;
+
+        let first = missing_compiler_output_error(&error, diagnostics, &mut reported);
+        let second = missing_compiler_output_error(&error, diagnostics, &mut reported);
+
+        assert!(first.contains(diagnostics));
+        assert!(!second.contains(diagnostics));
+        assert!(second.contains("reported with the first failed model"));
+    }
+
+    #[test]
+    fn dark_untextured_models_remain_visible() {
+        let color = visible_model_color([0.0, 0.0, 0.0], 0.22);
+        assert!(color.r() >= 24);
+        assert!(color.g() >= 28);
+        assert!(color.b() >= 30);
+    }
+
+    #[test]
+    fn reset_model_view_restores_the_default_camera() {
+        let (mut yaw, mut pitch, mut zoom) = (1.0, -1.0, 4.0);
+        reset_model_view(&mut yaw, &mut pitch, &mut zoom);
+        assert_eq!((yaw, pitch, zoom), (-0.65, 0.35, 1.0));
+    }
+
+    #[test]
+    fn resource_edit_round_trips_added_and_replaced_entries() {
+        let original_directory = tempfile::tempdir().unwrap();
+        let incoming_directory = tempfile::tempdir().unwrap();
+        let original = original_directory.path().join("sample.txt");
+        let replacement = incoming_directory.path().join("sample.txt");
+        let added_path = incoming_directory.path().join("added.txt");
+        fs::write(&original, b"original").unwrap();
+        fs::write(&replacement, b"replacement").unwrap();
+        fs::write(&added_path, b"added").unwrap();
+
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        archive.add_file(&original).unwrap();
+        let before = archive.entries[0].clone();
+        let after = archive.prepare_incoming_file(&replacement).unwrap();
+        let added = archive.prepare_incoming_file(&added_path).unwrap();
+        let edit = ArchiveEdit::Resources(vec![
+            ResourceChange {
+                key: ("sample".into(), before.type_id),
+                before: Some(before),
+                after: Some(after),
+            },
+            ResourceChange {
+                key: ("added".into(), added.type_id),
+                before: None,
+                after: Some(added),
+            },
+        ]);
+
+        apply_archive_edit(&mut archive, &edit, true).unwrap();
+        assert_eq!(archive.entries.len(), 2);
+        let sample = archive
+            .entries
+            .iter()
+            .find(|entry| entry.name == "sample")
+            .unwrap();
+        assert_eq!(sample.read_prefix(64).unwrap(), b"replacement");
+
+        apply_archive_edit(&mut archive, &edit, false).unwrap();
+        assert_eq!(archive.entries.len(), 1);
+        assert_eq!(archive.entries[0].read_prefix(64).unwrap(), b"original");
+    }
+
+    #[test]
+    fn edit_history_is_bounded_and_new_edits_clear_redo() {
+        let transaction = |label: String| EditTransaction {
+            label,
+            edit: ArchiveEdit::Description {
+                before: "before".into(),
+                after: "after".into(),
+            },
+            selected_before: BTreeSet::new(),
+            selected_after: BTreeSet::new(),
+            category_before: None,
+            category_after: None,
+            dirty_before: false,
+            dirty_after: true,
+            estimated_bytes: 1,
+        };
+        let mut history = EditHistory::default();
+        for index in 0..MAX_UNDO_STEPS + 5 {
+            assert!(history.record(transaction(index.to_string())));
+        }
+        assert_eq!(history.undo.len(), MAX_UNDO_STEPS);
+
+        let undone = history.undo.pop_back().unwrap();
+        history.redo.push_back(undone);
+        assert!(history.record(transaction("new".into())));
+        assert!(history.redo.is_empty());
+
+        let mut oversized = transaction("oversized".into());
+        oversized.estimated_bytes = MAX_UNDO_BYTES + 1;
+        assert!(!history.record(oversized));
+        assert!(history.undo.is_empty());
+    }
+
+    #[test]
+    fn description_edit_round_trips() {
+        let mut archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        let original = archive.description();
+        let edit = ArchiveEdit::Description {
+            before: original.clone(),
+            after: "Changed".into(),
+        };
+        apply_archive_edit(&mut archive, &edit, true).unwrap();
+        assert_eq!(archive.description(), "Changed");
+        apply_archive_edit(&mut archive, &edit, false).unwrap();
+        assert_eq!(archive.description(), original);
+    }
+
+    #[test]
+    fn redo_refuses_missing_external_resources_without_mutating_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.txt");
+        fs::write(&path, b"temporary").unwrap();
+        let archive = Archive::new(ArchiveKind::Hak, ArchiveVersion::V1_0);
+        let entry = archive.prepare_incoming_file(&path).unwrap();
+        let edit = ArchiveEdit::Resources(vec![ResourceChange {
+            key: (entry.name.to_ascii_lowercase(), entry.type_id),
+            before: None,
+            after: Some(entry),
+        }]);
+        fs::remove_file(path).unwrap();
+
+        let mut archive = archive;
+        assert!(apply_archive_edit(&mut archive, &edit, true).is_err());
+        assert!(archive.entries.is_empty());
     }
 
     #[test]

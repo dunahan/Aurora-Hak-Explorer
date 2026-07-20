@@ -2,6 +2,30 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.2.4 — 2026-07-20
+
+- Add a Tileset category to the Resource Tree for NWN `.set` tileset
+  definitions.
+- Add a Music category for `.wav`, `.bmu`, `.mp3`, and `.ogg` audio resources,
+  and keep Other at the bottom of the Resource Tree.
+- Show a tileset definition's `UnlocalizedName` beside its filename in Details.
+- Refresh the model viewport with a dark blue-gray background, subtle
+  orientation grid, and visible cool-gray fallback shading for black or
+  untextured models.
+- Make the model viewport's advertised double-click camera reset reliable.
+- Add per-tab Undo (`Ctrl+Z`) and Redo (`Ctrl+Shift+Z`) for imports, paste and
+  cut operations, merges, resource deletion, and description edits.
+- Keep edit history entirely in memory, bounded to 32 operations and a 64 MiB
+  estimated metadata budget per tab, and clear it safely after saving.
+- Recover every AHE-owned drag, clipboard, and model-compilation temporary
+  directory after crashes or interrupted system shutdowns.
+- Journal atomic archive-save temporary files so a partial multi-gigabyte save
+  is removed safely on the next launch after power loss.
+- Keep large model-compilation failure reports compact by recording batch
+  diagnostics once instead of repeating them for every failed model.
+- Refresh Linux release metadata and generate versioned Windows portable
+  instructions directly from the package version.
+
 ## 1.2.3 — 2026-07-20
 
 - Refine the archive tab bar with fixed-size browser-style tabs whose active

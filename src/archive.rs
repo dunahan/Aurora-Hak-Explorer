@@ -673,10 +673,11 @@ impl Archive {
             .map(|metadata| metadata.permissions());
         let parent = output.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        let (mut temp, _recovery_record) = crate::save_cleanup::create_save_file(parent)?;
         self.write_to(temp.as_file_mut())?;
         temp.as_file_mut().sync_all()?;
         temp.persist(output).map_err(|e| e.error)?;
+        let _ = sync_directory(parent);
         if let Some(permissions) = existing_permissions {
             fs::set_permissions(output, permissions)?;
         } else {
@@ -913,6 +914,16 @@ fn write_u16(output: &mut impl Write, n: u16) -> io::Result<()> {
 }
 fn write_u32(output: &mut impl Write, n: u32) -> io::Result<()> {
     output.write_all(&n.to_le_bytes())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

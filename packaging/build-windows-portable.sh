@@ -13,6 +13,8 @@ trap 'find "$package" -depth -delete' EXIT
 
 install -Dm755 "$binary" "$package/Aurora-Hak-Explorer.exe"
 install -Dm644 "$root/CHANGELOG.md" "$package/CHANGELOG.md"
+sed "s/@VERSION@/$version/g" "$root/packaging/WINDOWS-PORTABLE.txt" \
+  > "$package/README-WINDOWS.txt"
 
 rm -f "$output"
 (cd "$package" && zip -q -9 -r "$output" .)

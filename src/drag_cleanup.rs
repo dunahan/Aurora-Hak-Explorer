@@ -20,7 +20,7 @@ struct HelperProcess {
 static HELPER: OnceLock<Mutex<Option<HelperProcess>>> = OnceLock::new();
 
 pub fn register(path: &Path, retention: Duration) {
-    if !is_safe_temp_directory(path) {
+    if !is_safe_cleanup_path(path) {
         eprintln!(
             "Refusing to register an unsafe temporary cleanup path: {}",
             path.display()
@@ -61,7 +61,7 @@ pub fn recover_abandoned() {
     let mut pending = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !is_recoverable_drag_directory(&path) {
+        if !is_recoverable_directory(&path) {
             continue;
         }
         let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -149,7 +149,7 @@ fn process_records(reader: impl BufRead) -> io::Result<()> {
             continue;
         };
         let path = PathBuf::from(path);
-        if !is_safe_temp_directory(&path) {
+        if !is_safe_cleanup_path(&path) {
             continue;
         }
         deadlines.insert(path, UNIX_EPOCH + Duration::from_millis(deadline));
@@ -161,9 +161,13 @@ fn process_records(reader: impl BufRead) -> io::Result<()> {
         if let Ok(delay) = deadline.duration_since(SystemTime::now()) {
             std::thread::sleep(delay);
         }
-        remove_safe_temp_directory(&path);
+        remove_safe_cleanup_path(&path);
     }
     Ok(())
+}
+
+fn is_safe_cleanup_path(path: &Path) -> bool {
+    is_safe_temp_directory(path) || crate::save_cleanup::is_recovery_record(path)
 }
 
 fn is_safe_temp_directory(path: &Path) -> bool {
@@ -184,12 +188,8 @@ fn is_safe_temp_directory(path: &Path) -> bool {
             })
 }
 
-fn is_recoverable_drag_directory(path: &Path) -> bool {
+fn is_recoverable_directory(path: &Path) -> bool {
     is_safe_temp_directory(path)
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("ahe-drag-"))
 }
 
 fn remove_safe_temp_directory(path: &Path) {
@@ -201,6 +201,14 @@ fn remove_safe_temp_directory(path: &Path) {
     };
     if metadata.is_dir() && !metadata.file_type().is_symlink() {
         let _ = fs::remove_dir_all(path);
+    }
+}
+
+fn remove_safe_cleanup_path(path: &Path) {
+    if is_safe_temp_directory(path) {
+        remove_safe_temp_directory(path);
+    } else if crate::save_cleanup::is_recovery_record(path) {
+        crate::save_cleanup::recover_record(path);
     }
 }
 
@@ -228,17 +236,18 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_filters_names_and_calculates_remaining_age() {
-        let drag = tempfile::Builder::new()
-            .prefix("ahe-drag-")
-            .tempdir()
-            .unwrap();
-        let clipboard = tempfile::Builder::new()
-            .prefix("ahe-clipboard-")
-            .tempdir()
-            .unwrap();
-        assert!(is_recoverable_drag_directory(drag.path()));
-        assert!(!is_recoverable_drag_directory(clipboard.path()));
+    fn startup_recovery_accepts_every_owned_prefix_and_calculates_remaining_age() {
+        for prefix in [
+            "ahe-drag-",
+            "ahe-clipboard-",
+            "ahe-model-compiler-",
+            "ahe-model-compile-",
+        ] {
+            let directory = tempfile::Builder::new().prefix(prefix).tempdir().unwrap();
+            assert!(is_recoverable_directory(directory.path()));
+        }
+        let unrelated = tempfile::tempdir().unwrap();
+        assert!(!is_recoverable_directory(unrelated.path()));
 
         let now = SystemTime::now();
         assert_eq!(
