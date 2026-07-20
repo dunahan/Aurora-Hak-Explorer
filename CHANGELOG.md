@@ -2,6 +2,25 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.2.3 — 2026-07-20
+
+- Refine the archive tab bar with fixed-size browser-style tabs whose active
+  state changes only their highlight, never their geometry.
+- Keep Open and Recent fixed while archive tabs scroll independently, center
+  the Recent label, and remove the redundant new-archive button from the tab
+  strip (File > New remains available).
+- Improve tab-strip spacing and the empty-state alignment; hide the resource
+  search field until an archive is open.
+- Show selected-resource counts and their Export (Ctrl+E) and Delete (Del)
+  shortcuts in the resource context menu.
+- Use concise, counted Compile & Export MDL and Decompile & Export MDL context
+  menu actions, shown only for eligible MDL selections.
+- Simplify File-menu labels, widen the menu for readable shortcuts, and add
+  Ctrl+Shift+S for Save As.
+- Harmonize selected Resource Tree categories with the active-tab blue-gray
+  palette while retaining a stronger sidebar focus state and brighter category
+  counts.
+
 ## 1.2.2 — 2026-07-19
 
 - Improve very large drag-and-drop operations: imports avoid duplicate file

@@ -2441,11 +2441,12 @@ impl eframe::App for HakEditor {
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New…   Ctrl+N").clicked() {
+                    ui.set_min_width(185.0);
+                    if ui.button("New   Ctrl+N").clicked() {
                         self.show_new = true;
                         ui.close();
                     }
-                    if ui.button("Open…   Ctrl+O").clicked() {
+                    if ui.button("Open   Ctrl+O").clicked() {
                         self.open_dialog();
                         ui.close();
                     }
@@ -2459,7 +2460,10 @@ impl eframe::App for HakEditor {
                         ui.close();
                     }
                     if ui
-                        .add_enabled(archive_editable, egui::Button::new("Save As…"))
+                        .add_enabled(
+                            archive_editable,
+                            egui::Button::new("Save As   Ctrl+Shift+S"),
+                        )
                         .clicked()
                     {
                         self.save(true);
@@ -2467,7 +2471,7 @@ impl eframe::App for HakEditor {
                     }
                     ui.separator();
                     if ui
-                        .add_enabled(enabled, egui::Button::new("Extract all…"))
+                        .add_enabled(enabled, egui::Button::new("Extract all"))
                         .clicked()
                     {
                         self.extract_all();
@@ -2645,195 +2649,256 @@ impl eframe::App for HakEditor {
             .then(|| native_drag_local_position(&ctx))
             .flatten();
         self.tab_drop_rects.clear();
-        egui::Panel::top("document_tabs").show(ui, |ui| {
-            // Keep the horizontal scrollbar in its own row so it cannot cover
-            // the lower edge of the archive tabs when many tabs are open.
-            ui.spacing_mut().scroll.floating = false;
-            egui::ScrollArea::horizontal()
-                .id_salt("open_archive_tabs")
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (new_rect, new_response) =
-                            ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
-                        if new_response.hovered() {
-                            ui.painter().rect_filled(
-                                new_rect,
-                                4.0,
-                                ui.visuals().widgets.hovered.bg_fill,
-                            );
+        egui::Panel::top("document_tabs")
+            .frame(
+                egui::Frame::side_top_panel(ui.style()).inner_margin(egui::Margin::symmetric(8, 2)),
+            )
+            .show(ui, |ui| {
+                // Keep the horizontal scrollbar in its own row so it cannot cover
+                // the lower edge of the archive tabs when many tabs are open.
+                ui.spacing_mut().scroll.floating = false;
+                ui.horizontal_top(|ui| {
+                    let open_clicked = ui
+                        .add_sized([69.0, 31.0], egui::Button::new("Open"))
+                        .on_hover_text("Open archive (Ctrl+O)")
+                        .clicked();
+                    if open_clicked {
+                        self.open_dialog();
+                    }
+                    let recent_archives = self.recent_archives.clone();
+                    let mut requested_recent = None;
+                    let mut clear_recent = false;
+                    // The standard menu button reserves label space for a disclosure
+                    // indicator, which makes this short label look visibly off-center.
+                    // Paint the label over an empty native button instead.
+                    let recent_response = ui.add_sized([83.0, 31.0], egui::Button::new(""));
+                    recent_response
+                        .clone()
+                        .on_hover_text("Open a recent archive");
+                    ui.painter().text(
+                        recent_response.rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Recent",
+                        egui::TextStyle::Button.resolve(ui.style()),
+                        ui.style().interact(&recent_response).text_color(),
+                    );
+                    let _ = egui::Popup::menu(&recent_response).show(|ui| {
+                        ui.set_min_width(260.0);
+                        if recent_archives.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No recent archives"));
+                            return;
                         }
-                        ui.painter().text(
-                            new_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "+",
-                            egui::FontId::proportional(18.0),
-                            ui.visuals().strong_text_color(),
-                        );
-                        if new_response.on_hover_text("New archive").clicked() {
-                            self.show_new = true;
-                        }
-                        ui.add_space(2.0);
-                        if ui
-                            .add_sized([52.0, 26.0], egui::Button::new("Open"))
-                            .on_hover_text("Open archive (Ctrl+O)")
-                            .clicked()
-                        {
-                            self.open_dialog();
-                        }
-                        let recent_archives = self.recent_archives.clone();
-                        let mut requested_recent = None;
-                        let mut clear_recent = false;
-                        let (recent_response, _) = egui::containers::menu::MenuButton::from_button(
-                            egui::Button::new("Recent").min_size(egui::vec2(64.0, 26.0)),
-                        )
-                        .ui(ui, |ui| {
-                            ui.set_min_width(260.0);
-                            if recent_archives.is_empty() {
-                                ui.add_enabled(false, egui::Button::new("No recent archives"));
-                                return;
-                            }
-                            for path in recent_archives {
-                                let filename = path
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| path.display().to_string());
-                                if ui
-                                    .button(filename)
-                                    .on_hover_text(path.display().to_string())
-                                    .clicked()
-                                {
-                                    requested_recent = Some(path);
-                                    ui.close();
-                                }
-                            }
-                            ui.separator();
-                            if ui.button("Clear recent files").clicked() {
-                                clear_recent = true;
+                        for path in recent_archives {
+                            let filename = path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+                            if ui
+                                .button(filename)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                requested_recent = Some(path);
                                 ui.close();
                             }
-                        });
-                        recent_response.on_hover_text("Open a recent archive");
-                        if clear_recent {
-                            self.recent_archives.clear();
-                        } else if let Some(path) = requested_recent {
-                            if path.is_file() {
-                                self.open_path(path);
-                            } else {
-                                self.recent_archives.retain(|recent| recent != &path);
-                                self.status =
-                                    format!("Removed missing recent archive: {}", path.display());
-                            }
                         }
-                        ui.add_space(4.0);
-
-                        for (index, tab_state) in self.tabs.iter().enumerate() {
-                            let active = self.active_tab == Some(index);
-                            let dirty = if active { self.dirty } else { tab_state.dirty };
-                            let label =
-                                format!("{}{}", if dirty { "* " } else { "" }, tab_state.label());
-                            let selection = ui.visuals().selection.bg_fill;
-                            let tab = egui::Frame::new()
-                                .fill(if active {
-                                    selection.gamma_multiply(0.28)
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .stroke(if active {
-                                    egui::Stroke::new(1.0, selection.gamma_multiply(0.55))
-                                } else {
-                                    egui::Stroke::NONE
-                                })
-                                .corner_radius(4)
-                                .inner_margin(egui::Margin::symmetric(8, 3))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let title = ui.add(
-                                            egui::Label::new(RichText::new(label).color(
-                                                if active {
-                                                    ui.visuals().strong_text_color()
-                                                } else {
-                                                    ui.visuals().text_color()
-                                                },
-                                            ))
-                                            .selectable(false)
-                                            .sense(egui::Sense::click()),
-                                        );
-                                        let (close_rect, close) = ui.allocate_exact_size(
-                                            egui::vec2(18.0, 18.0),
-                                            egui::Sense::click(),
-                                        );
-                                        if close.hovered() {
-                                            ui.painter().rect_filled(
-                                                close_rect,
-                                                4.0,
-                                                selection.gamma_multiply(0.72),
-                                            );
-                                        }
-                                        ui.painter().text(
-                                            close_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            "×",
-                                            egui::FontId::proportional(14.0),
-                                            ui.visuals().strong_text_color(),
-                                        );
-                                        (title, close.on_hover_text("Close tab"))
-                                    })
-                                    .inner
-                                });
-                            self.tab_drop_rects.push((index, tab.response.rect));
-                            if active {
-                                ui.painter().line_segment(
-                                    [
-                                        egui::pos2(
-                                            tab.response.rect.left() + 4.0,
-                                            tab.response.rect.bottom(),
-                                        ),
-                                        egui::pos2(
-                                            tab.response.rect.right() - 4.0,
-                                            tab.response.rect.bottom(),
-                                        ),
-                                    ],
-                                    egui::Stroke::new(2.0, selection),
-                                );
-                            } else if tab.response.hovered() {
-                                ui.painter().rect_stroke(
-                                    tab.response.rect,
-                                    4.0,
-                                    egui::Stroke::new(1.0, selection.gamma_multiply(0.75)),
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            tab.inner.0.context_menu(|ui| {
-                                if ui.button("Close tab").clicked() {
-                                    requested_close = Some(index);
-                                    ui.close();
-                                }
-                            });
-                            if tab.inner.0.clicked() {
-                                requested_switch = Some(index);
-                            }
-                            if native_drag_position
-                                .is_some_and(|position| tab.response.rect.contains(position))
-                                && !active
-                            {
-                                requested_switch = Some(index);
-                            }
-                            if tab.inner.1.clicked() {
-                                requested_close = Some(index);
-                            }
-                            if middle_click
-                                .is_some_and(|position| tab.response.rect.contains(position))
-                            {
-                                requested_close = Some(index);
-                            }
-                            ui.add_space(2.0);
-                        }
-                        if self.tabs.is_empty() {
-                            ui.label(RichText::new("No archives open").weak());
+                        ui.separator();
+                        if ui.button("Clear recent files").clicked() {
+                            clear_recent = true;
+                            ui.close();
                         }
                     });
+                    if clear_recent {
+                        self.recent_archives.clear();
+                    } else if let Some(path) = requested_recent {
+                        if path.is_file() {
+                            self.open_path(path);
+                        } else {
+                            self.recent_archives.retain(|recent| recent != &path);
+                            self.status =
+                                format!("Removed missing recent archive: {}", path.display());
+                        }
+                    }
+                    ui.add_space(4.0);
+                    let tabs_width = ui.available_width();
+                    egui::ScrollArea::horizontal()
+                        .id_salt("open_archive_tabs")
+                        .max_width(tabs_width)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (index, tab_state) in self.tabs.iter().enumerate() {
+                                    let active = self.active_tab == Some(index);
+                                    let dirty = if active { self.dirty } else { tab_state.dirty };
+                                    let label = format!(
+                                        "{}{}",
+                                        if dirty { "* " } else { "" },
+                                        tab_state.label()
+                                    );
+                                    // Keep this document-tab treatment visually identical to Aurora TLK
+                                    // Explorer without changing AHE's general resource-selection colour.
+                                    let selection = if ui.visuals().dark_mode {
+                                        Color32::from_rgb(45, 67, 82)
+                                    } else {
+                                        Color32::from_rgb(178, 205, 226)
+                                    };
+                                    let title_color = if active {
+                                        ui.visuals().strong_text_color()
+                                    } else {
+                                        ui.visuals().text_color()
+                                    };
+                                    let title_font = egui::TextStyle::Body.resolve(ui.style());
+                                    let title_width = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            label.clone(),
+                                            title_font.clone(),
+                                            title_color,
+                                        )
+                                        .size()
+                                        .x;
+                                    let tab_size = egui::vec2(
+                                        12.0 + title_width
+                                            + ui.spacing().item_spacing.x
+                                            + 23.0
+                                            + 12.0,
+                                        31.0,
+                                    );
+                                    let (tab_rect, _) =
+                                        ui.allocate_exact_size(tab_size, egui::Sense::hover());
+                                    let tab_id = ui.make_persistent_id(("archive_tab", index));
+                                    let close_rect = egui::Rect::from_min_size(
+                                        egui::pos2(tab_rect.right() - 35.0, tab_rect.top() + 4.0),
+                                        egui::vec2(23.0, 23.0),
+                                    );
+                                    let title_rect = egui::Rect::from_min_max(
+                                        egui::pos2(tab_rect.left() + 12.0, tab_rect.top() + 4.0),
+                                        egui::pos2(
+                                            close_rect.left() - ui.spacing().item_spacing.x,
+                                            tab_rect.bottom() - 4.0,
+                                        ),
+                                    );
+                                    let title = ui.interact(
+                                        title_rect,
+                                        tab_id.with("title"),
+                                        egui::Sense::click(),
+                                    );
+                                    let close = ui
+                                        .interact(
+                                            close_rect,
+                                            tab_id.with("close"),
+                                            egui::Sense::click(),
+                                        )
+                                        .on_hover_text("Close tab");
+                                    if active {
+                                        ui.painter().rect_filled(
+                                            tab_rect,
+                                            4.0,
+                                            selection.gamma_multiply(0.82),
+                                        );
+                                    }
+                                    if close.hovered() {
+                                        ui.painter().rect_filled(
+                                            close_rect,
+                                            4.0,
+                                            selection.gamma_multiply(0.72),
+                                        );
+                                    }
+                                    ui.painter().text(
+                                        egui::pos2(title_rect.left(), title_rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &label,
+                                        title_font,
+                                        title_color,
+                                    );
+                                    ui.painter().text(
+                                        close_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "×",
+                                        egui::FontId::proportional(14.0),
+                                        ui.visuals().strong_text_color(),
+                                    );
+                                    self.tab_drop_rects.push((index, tab_rect));
+                                    if active {
+                                        ui.painter().rect_stroke(
+                                            tab_rect,
+                                            4.0,
+                                            egui::Stroke::new(1.0, selection.gamma_multiply(0.95)),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        ui.painter().line_segment(
+                                            [
+                                                egui::pos2(
+                                                    tab_rect.left() + 4.0,
+                                                    tab_rect.bottom(),
+                                                ),
+                                                egui::pos2(
+                                                    tab_rect.right() - 4.0,
+                                                    tab_rect.bottom(),
+                                                ),
+                                            ],
+                                            egui::Stroke::new(2.0, selection),
+                                        );
+                                    } else if title.hovered() || close.hovered() {
+                                        ui.painter().rect_stroke(
+                                            tab_rect,
+                                            4.0,
+                                            egui::Stroke::new(1.0, selection.gamma_multiply(0.75)),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                    title.context_menu(|ui| {
+                                        if ui.button("Close tab").clicked() {
+                                            requested_close = Some(index);
+                                            ui.close();
+                                        }
+                                    });
+                                    if title.clicked() {
+                                        requested_switch = Some(index);
+                                    }
+                                    if native_drag_position
+                                        .is_some_and(|position| tab_rect.contains(position))
+                                        && !active
+                                    {
+                                        requested_switch = Some(index);
+                                    }
+                                    if close.clicked() {
+                                        requested_close = Some(index);
+                                    }
+                                    if middle_click
+                                        .is_some_and(|position| tab_rect.contains(position))
+                                    {
+                                        requested_close = Some(index);
+                                    }
+                                    ui.add_space(2.0);
+                                }
+                                if self.tabs.is_empty() {
+                                    let empty_font = egui::TextStyle::Body.resolve(ui.style());
+                                    let empty_color = ui.visuals().weak_text_color();
+                                    let empty_width = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            "No archives open".into(),
+                                            empty_font.clone(),
+                                            empty_color,
+                                        )
+                                        .size()
+                                        .x;
+                                    let (empty_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(empty_width, 31.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().text(
+                                        egui::pos2(empty_rect.left(), empty_rect.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "No archives open",
+                                        empty_font,
+                                        empty_color,
+                                    );
+                                }
+                            });
+                        });
                 });
-        });
+            });
         if !self.blocking_dialog_open()
             && let Some(index) = requested_close
         {
@@ -2858,7 +2923,14 @@ impl eframe::App for HakEditor {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O)) {
                 self.open_dialog();
             }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
+            let ctrl_shift = egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            };
+            if ctx.input_mut(|i| i.consume_key(ctrl_shift, egui::Key::S)) {
+                self.save(true);
+            } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
                 self.save(false);
             }
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
@@ -3165,14 +3237,14 @@ impl eframe::App for HakEditor {
             ui.horizontal(|ui| {
                 if let Some((name, _, _, _, _)) = &archive_info {
                     ui.strong(name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.filter)
+                                .hint_text("Search resources…")
+                                .desired_width(260.0),
+                        );
+                    });
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("Search resources…")
-                            .desired_width(260.0),
-                    );
-                });
             });
             ui.separator();
             if let Some(a) = self.archive.as_ref() {
@@ -3467,42 +3539,34 @@ impl eframe::App for HakEditor {
                                             .strong(),
                                         );
                                         ui.separator();
-                                        if ui.button("Export selected…").clicked() {
+                                        if ui
+                                            .button(format!("Export Selected ({count})   Ctrl+E"))
+                                            .clicked()
+                                        {
                                             request_export = true;
                                             ui.close();
                                         }
                                         let model_export_action =
                                             selected_model_export_action(a, &self.selected);
-                                        let model_export_label = match model_export_action {
-                                            Some(ModelExportAction::Compile) if count == 1 => {
-                                                "Compile and export model…"
+                                        if let Some(model_export_action) = model_export_action {
+                                            let model_export_label = match model_export_action {
+                                                ModelExportAction::Compile => {
+                                                    format!("Compile & Export MDL ({count})")
+                                                }
+                                                ModelExportAction::Decompile => {
+                                                    format!("Decompile & Export MDL ({count})")
+                                                }
+                                            };
+                                            if ui.button(model_export_label).clicked() {
+                                                request_model_export = Some(model_export_action);
+                                                ui.close();
                                             }
-                                            Some(ModelExportAction::Compile) => {
-                                                "Compile and export selected models…"
-                                            }
-                                            Some(ModelExportAction::Decompile) if count == 1 => {
-                                                "Decompile and export model…"
-                                            }
-                                            Some(ModelExportAction::Decompile) => {
-                                                "Decompile and export selected models…"
-                                            }
-                                            None => "Compile/decompile selected models…",
-                                        };
-                                        if ui
-                                            .add_enabled(
-                                                model_export_action.is_some(),
-                                                egui::Button::new(model_export_label),
-                                            )
-                                            .clicked()
-                                        {
-                                            request_model_export = model_export_action;
-                                            ui.close();
                                         }
                                         if ui
                                             .add_enabled(
                                                 archive_editable,
                                                 egui::Button::new(format!(
-                                                    "Delete selected ({count})"
+                                                    "Delete Selected ({count})   Del"
                                                 )),
                                             )
                                             .clicked()
@@ -5092,15 +5156,21 @@ fn native_drag_local_position(ctx: &egui::Context) -> Option<egui::Pos2> {
 }
 
 fn resource_tree_row(ui: &mut egui::Ui, active: bool, label: &str, count: usize) -> egui::Response {
-    let selection = ui.visuals().selection.bg_fill;
+    // Keep the resource category selection in the same blue-gray family as
+    // the active archive tab, but slightly stronger for clear sidebar focus.
+    let selection = if ui.visuals().dark_mode {
+        Color32::from_rgb(35, 70, 88)
+    } else {
+        Color32::from_rgb(160, 196, 220)
+    };
     let row = egui::Frame::new()
         .fill(if active {
-            selection.gamma_multiply(0.25)
+            selection
         } else {
             Color32::TRANSPARENT
         })
         .stroke(if active {
-            egui::Stroke::new(1.0, selection.gamma_multiply(0.5))
+            egui::Stroke::new(1.0, selection.gamma_multiply(0.9))
         } else {
             egui::Stroke::NONE
         })
@@ -5110,12 +5180,20 @@ fn resource_tree_row(ui: &mut egui::Ui, active: bool, label: &str, count: usize)
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 let response = ui.add(
-                    egui::Label::new(label)
-                        .selectable(false)
-                        .sense(egui::Sense::click()),
+                    egui::Label::new(RichText::new(label).color(if active {
+                        ui.visuals().strong_text_color()
+                    } else {
+                        ui.visuals().text_color()
+                    }))
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(count.to_string()).weak());
+                    ui.label(RichText::new(count.to_string()).color(if active {
+                        ui.visuals().strong_text_color()
+                    } else {
+                        ui.visuals().text_color()
+                    }));
                 });
                 response
             })
