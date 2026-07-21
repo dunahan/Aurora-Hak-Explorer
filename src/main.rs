@@ -182,6 +182,8 @@ struct HakEditor {
     selection_cursor: Option<usize>,
     hovered_drop_files: Vec<String>,
     hovered_drop_file_count: usize,
+    hovered_drop_unsupported_count: usize,
+    hovered_drop_unsupported_extensions: BTreeSet<String>,
     pending_drop_files: Vec<PathBuf>,
     incoming_paths: Option<mpsc::Receiver<Vec<PathBuf>>>,
     internal_drag_origins: BTreeMap<PathBuf, InternalDragOrigin>,
@@ -631,6 +633,8 @@ impl HakEditor {
             selection_cursor: None,
             hovered_drop_files: Vec::new(),
             hovered_drop_file_count: 0,
+            hovered_drop_unsupported_count: 0,
+            hovered_drop_unsupported_extensions: BTreeSet::new(),
             pending_drop_files: Vec::new(),
             incoming_paths: None,
             internal_drag_origins: BTreeMap::new(),
@@ -2648,7 +2652,12 @@ impl eframe::App for HakEditor {
         if !forwarded.is_empty() {
             self.pending_drop_files.extend(forwarded);
         }
-        let (hovered_drop_file_count, hovered_drop_files) = ctx.input(|input| {
+        let (
+            hovered_drop_file_count,
+            hovered_drop_files,
+            hovered_drop_unsupported_count,
+            hovered_drop_unsupported_extensions,
+        ) = ctx.input(|input| {
             let files = &input.raw.hovered_files;
             let names = files
                 .iter()
@@ -2662,10 +2671,29 @@ impl eframe::App for HakEditor {
                         .to_owned()
                 })
                 .collect();
-            (files.len(), names)
+            let unsupported_extensions = files
+                .iter()
+                .filter_map(|file| file.path.as_deref())
+                .filter(|path| !path.is_dir())
+                .filter_map(unsupported_import_extension)
+                .collect::<BTreeSet<_>>();
+            let unsupported_count = files
+                .iter()
+                .filter_map(|file| file.path.as_deref())
+                .filter(|path| !path.is_dir())
+                .filter(|path| unsupported_import_extension(path).is_some())
+                .count();
+            (
+                files.len(),
+                names,
+                unsupported_count,
+                unsupported_extensions,
+            )
         });
         self.hovered_drop_file_count = hovered_drop_file_count;
         self.hovered_drop_files = hovered_drop_files;
+        self.hovered_drop_unsupported_count = hovered_drop_unsupported_count;
+        self.hovered_drop_unsupported_extensions = hovered_drop_unsupported_extensions;
         let mut dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
@@ -2756,8 +2784,38 @@ impl eframe::App for HakEditor {
                     egui::Frame::popup(ui.style())
                         .inner_margin(32.0)
                         .show(ui, |ui| {
-                            ui.heading("Drop files or folders to add to this archive");
-                            ui.label(format!("{} file(s) ready", self.hovered_drop_file_count));
+                            if self.hovered_drop_unsupported_count > 0 {
+                                let accepted = self
+                                    .hovered_drop_file_count
+                                    .saturating_sub(self.hovered_drop_unsupported_count);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("×")
+                                            .size(42.0)
+                                            .color(Color32::from_rgb(255, 130, 130)),
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.heading("Unsupported file type");
+                                        ui.label(format!(
+                                            "{} file(s) will be skipped: {}",
+                                            self.hovered_drop_unsupported_count,
+                                            self.hovered_drop_unsupported_extensions
+                                                .iter()
+                                                .cloned()
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        ));
+                                        if accepted > 0 {
+                                            ui.label(format!(
+                                                "{accepted} supported file(s) will be added"
+                                            ));
+                                        }
+                                    });
+                                });
+                            } else {
+                                ui.heading("Drop files or folders to add to this archive");
+                                ui.label(format!("{} file(s) ready", self.hovered_drop_file_count));
+                            }
                             for name in &self.hovered_drop_files {
                                 ui.label(name);
                             }
