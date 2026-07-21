@@ -180,7 +180,7 @@ struct HakEditor {
     sort_ascending: bool,
     selection_anchor: Option<usize>,
     selection_cursor: Option<usize>,
-    hovered_drop_files: Vec<String>,
+    hovered_drop_files: Vec<HoveredDropFile>,
     hovered_drop_file_count: usize,
     hovered_drop_unsupported_count: usize,
     hovered_drop_unsupported_extensions: BTreeSet<String>,
@@ -222,6 +222,11 @@ struct HakEditor {
     quit_after_model_compile: bool,
     #[cfg(target_os = "linux")]
     dnd_extract: Option<dnd_extract::Bridge>,
+}
+
+struct HoveredDropFile {
+    name: String,
+    unsupported: bool,
 }
 
 struct ImagePreviewCache {
@@ -2659,16 +2664,22 @@ impl eframe::App for HakEditor {
             hovered_drop_unsupported_extensions,
         ) = ctx.input(|input| {
             let files = &input.raw.hovered_files;
-            let names = files
+            let preview_files = files
                 .iter()
                 .take(5)
                 .map(|file| {
-                    file.path
-                        .as_ref()
-                        .and_then(|path| path.file_name())
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("file")
-                        .to_owned()
+                    let path = file.path.as_deref();
+                    HoveredDropFile {
+                        name: path
+                            .as_ref()
+                            .and_then(|path| path.file_name())
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("file")
+                            .to_owned(),
+                        unsupported: path
+                            .filter(|path| !path.is_dir())
+                            .is_some_and(|path| unsupported_import_extension(path).is_some()),
+                    }
                 })
                 .collect();
             let unsupported_extensions = files
@@ -2685,7 +2696,7 @@ impl eframe::App for HakEditor {
                 .count();
             (
                 files.len(),
-                names,
+                preview_files,
                 unsupported_count,
                 unsupported_extensions,
             )
@@ -2795,9 +2806,9 @@ impl eframe::App for HakEditor {
                                             .color(Color32::from_rgb(255, 130, 130)),
                                     );
                                     ui.vertical(|ui| {
-                                        ui.heading("Unsupported file type");
+                                        ui.heading("Some files cannot be added");
                                         ui.label(format!(
-                                            "{} file(s) will be skipped: {}",
+                                            "{} file(s) will be skipped ({})",
                                             self.hovered_drop_unsupported_count,
                                             self.hovered_drop_unsupported_extensions
                                                 .iter()
@@ -2805,19 +2816,59 @@ impl eframe::App for HakEditor {
                                                 .collect::<Vec<_>>()
                                                 .join(", ")
                                         ));
-                                        if accepted > 0 {
-                                            ui.label(format!(
-                                                "{accepted} supported file(s) will be added"
-                                            ));
-                                        }
                                     });
                                 });
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.add_space(3.0);
+                                for file in &self.hovered_drop_files {
+                                    let (color, action) = if file.unsupported {
+                                        (Color32::from_rgb(255, 130, 130), "Skipped")
+                                    } else {
+                                        (Color32::from_rgb(120, 190, 240), "Added")
+                                    };
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(12.0, ui.spacing().interact_size.y),
+                                            egui::Sense::hover(),
+                                        );
+                                        if file.unsupported {
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "×",
+                                                egui::TextStyle::Body.resolve(ui.style()),
+                                                color,
+                                            );
+                                        } else {
+                                            ui.painter().circle_filled(rect.center(), 3.0, color);
+                                        }
+                                        ui.label(&file.name);
+                                        ui.label(RichText::new(action).color(color));
+                                    });
+                                }
+                                if self.hovered_drop_file_count > self.hovered_drop_files.len() {
+                                    ui.label(format!(
+                                        "and {} more file(s)",
+                                        self.hovered_drop_file_count
+                                            - self.hovered_drop_files.len()
+                                    ));
+                                }
+                                ui.add_space(3.0);
+                                if accepted > 0 {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{accepted} supported file(s) will be added"
+                                        ))
+                                        .color(Color32::from_rgb(120, 190, 240)),
+                                    );
+                                }
                             } else {
                                 ui.heading("Drop files or folders to add to this archive");
                                 ui.label(format!("{} file(s) ready", self.hovered_drop_file_count));
-                            }
-                            for name in &self.hovered_drop_files {
-                                ui.label(name);
+                                for file in &self.hovered_drop_files {
+                                    ui.label(&file.name);
+                                }
                             }
                         });
                 });
