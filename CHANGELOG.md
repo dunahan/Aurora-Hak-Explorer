@@ -2,6 +2,102 @@
 
 All notable changes to Aurora Hak Explorer are recorded here.
 
+## 1.3.0 — 2026-07-22
+
+- Add the memory-safe Rust Aurora nwnmdlcomp compiler and decompiler on Linux
+  and Windows.
+- Use the Rust compiler's parallel multi-file CLI directly while preserving
+  AHE's cancellation, dependency staging, output validation, and compact
+  failure reports.
+- Bundle a portable x86-64 Linux compiler requiring no newer than glibc 2.17
+  and a native Windows x86-64 compiler.
+- Update Aurora nwnmdlcomp to 0.1.1, correcting compiled MDL resource-name
+  field widths and accepting recognizable legacy timestamp preambles and
+  face rows with an omitted optional surface value in compatibility mode.
+- Keep the complete Rust compiler source and its pinned, patched, vendored
+  `nwnrs-types` dependency alongside AHE for reproducible GPL-compliant
+  releases.
+- Compile standalone custom-content models even when their declared
+  supermodel is absent, while continuing to stage and validate supermodels
+  whenever they are available.
+- Update the bundled Rust MDL compiler to accept legacy model headers where a
+  filename was accidentally joined to the non-semantic `#MAXMODEL` marker.
+
+## 1.2.5 — 2026-07-21
+
+- Replace the import blocklist with a strict NWN/NWN:EE resource-type
+  allowlist; arbitrary files and NWN2-only resource types cannot be added or
+  merged into an archive.
+- Show a clear error dialog naming unsupported file types skipped during file
+  picker, clipboard, drag-and-drop, or folder imports.
+- Warn when opening an existing archive that contains resource types outside
+  the NWN/NWN:EE allowlist, while keeping those entries fully browsable and
+  extractable.
+- Refine resource-list middle-click scrolling into browser-style autoscroll:
+  click to set an anchor, move farther to accelerate, and click again, left
+  click, press Escape, or open a modal dialog to stop.
+
+## 1.2.4 — 2026-07-20
+
+- Add a Tileset category to the Resource Tree for NWN `.set` tileset
+  definitions.
+- Add a Music category for `.wav`, `.bmu`, `.mp3`, and `.ogg` audio resources,
+  and keep Other at the bottom of the Resource Tree.
+- Show a tileset definition's `UnlocalizedName` beside its filename in Details.
+- Refresh the model viewport with a dark blue-gray background, subtle
+  orientation grid, and visible cool-gray fallback shading for black or
+  untextured models.
+- Make the model viewport's advertised double-click camera reset reliable.
+- Add per-tab Undo (`Ctrl+Z`) and Redo (`Ctrl+Shift+Z`) for imports, paste and
+  cut operations, merges, resource deletion, and description edits.
+- Keep edit history entirely in memory, bounded to 32 operations and a 64 MiB
+  estimated metadata budget per tab, and clear it safely after saving.
+- Recover every AHE-owned drag, clipboard, and model-compilation temporary
+  directory after crashes or interrupted system shutdowns.
+- Journal atomic archive-save temporary files so a partial multi-gigabyte save
+  is removed safely on the next launch after power loss.
+- Keep large model-compilation failure reports compact by recording batch
+  diagnostics once instead of repeating them for every failed model.
+- Refresh Linux release metadata and generate versioned Windows portable
+  instructions directly from the package version.
+
+## 1.2.3 — 2026-07-20
+
+- Refine the archive tab bar with fixed-size browser-style tabs whose active
+  state changes only their highlight, never their geometry.
+- Keep Open and Recent fixed while archive tabs scroll independently, center
+  the Recent label, and remove the redundant new-archive button from the tab
+  strip (File > New remains available).
+- Improve tab-strip spacing and the empty-state alignment; hide the resource
+  search field until an archive is open.
+- Show selected-resource counts and their Export (Ctrl+E) and Delete (Del)
+  shortcuts in the resource context menu.
+- Use concise, counted Compile & Export MDL and Decompile & Export MDL context
+  menu actions, shown only for eligible MDL selections.
+- Simplify File-menu labels, widen the menu for readable shortcuts, and add
+  Ctrl+Shift+S for Save As.
+- Harmonize selected Resource Tree categories with the active-tab blue-gray
+  palette while retaining a stronger sidebar focus state and brighter category
+  counts.
+
+## 1.2.2 — 2026-07-19
+
+- Improve very large drag-and-drop operations: imports avoid duplicate file
+  metadata work and use adaptive UI batches, outgoing staging uses bounded
+  parallelism, Linux KDE drops extract lazily from the archive, and large
+  Windows drags avoid per-file Shell PIDL setup.
+- Ensure drag, clipboard, and model-workspace temporary directories are removed
+  after Aurora exits by handing their cleanup deadlines to a durable helper.
+- Remove completed drag staging directories after a fixed one-minute grace
+  period on both Linux and Windows.
+- Recover abandoned `ahe-drag-*` directories at startup after crashes or system
+  shutdowns, deleting those at least 15 minutes old immediately and scheduling
+  newer leftovers for their remaining safe-retention time.
+- Open BioWare BIFF V1 archives (`.bif`) for browsing, model and resource previews, drag/copy export, and extraction.
+- Match NWN Explorer's standalone-BIF naming convention (`resN.ext`) and keep BIF archives read-only to protect installed game data.
+- Automatically locate Steam, GOG, and Beamdog NWN installations, with a remembered manual installation-directory option under the Tools menu.
+- Bound and clean outgoing-drag staging on both platforms, release Windows Shell allocations correctly, persist installation-path clearing, and honor the manually selected NWN installation when duplicate game resources exist.
+
 ## 1.2.1 — 2026-07-19
 
 - Compile models in bounded batches with a shared workspace and dependency cache, greatly reducing helper-process and temporary-file overhead.

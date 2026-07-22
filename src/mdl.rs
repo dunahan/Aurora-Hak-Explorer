@@ -1,8 +1,7 @@
 //! Aurora MDL parsing, static geometry preview, and ASCII decompilation.
 //!
-//! The binary layout follows the public NWNTools model structures by Edward
-//! T. Smith and the Open Knights Consortium. This is a bounds-checked Rust
-//! implementation; no legacy code is linked into AHE.
+//! This is a bounds-checked Rust implementation and is independent of the
+//! bundled compiler.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -1116,11 +1115,10 @@ fn read_i32(bytes: &[u8], offset: usize) -> Result<i32, String> {
 fn read_f32(bytes: &[u8], offset: usize) -> Result<f32, String> {
     checked(bytes, offset, 4, "floating-point value")?;
     let value = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err("The model contains a non-finite number".into())
-    }
+    // Some legacy compiled MDLs carry uninitialised NaN/Infinity values in
+    // fields the engine does not consume. Match the bundled Rust decompiler:
+    // retain readable model data and expose those unusable values as zero.
+    Ok(if value.is_finite() { value } else { 0.0 })
 }
 fn read_vec3(bytes: &[u8], offset: usize) -> Result<[f32; 3], String> {
     Ok([
